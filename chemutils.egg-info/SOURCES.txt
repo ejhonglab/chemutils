@@ -1,0 +1,7 @@
+README.md
+chemutils.py
+chemutils.egg-info/PKG-INFO
+chemutils.egg-info/SOURCES.txt
+chemutils.egg-info/dependency_links.txt
+chemutils.egg-info/requires.txt
+chemutils.egg-info/top_level.txt
