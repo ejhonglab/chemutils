@@ -1,5 +1,8 @@
 
 import re
+import os
+import pickle
+import atexit
 
 import pubchempy as pcp
 
@@ -33,7 +36,20 @@ manual_name2cas = {
 }
 
 
-cache = dict()
+cache_file = os.path.expanduser('~/.chemutils_cache.p')
+if os.path.exists(cache_file):
+    with open(cache_file, 'rb') as f:
+        cache = pickle.load(f)
+    print(cache)
+else:
+    cache = dict()
+
+def save_cache():
+    with open(cache_file, 'wb') as f:
+        pickle.dump(cache, f)
+
+atexit.register(save_cache)
+
 def name2cas(name, verbose=False):
     """Returns the CAS number for the chemical with the given name.
 
@@ -73,6 +89,42 @@ def name2cas(name, verbose=False):
         cas_num = sorted(cas_number_candidates)[0]
 
     cache[name] = cas_num
+    return cas_num
+
+
+def cas2cas(cas, verbose=False):
+    """
+    """
+    # Can share cache w/ name2cache since function range is the same.
+    if cas in cache:
+        if verbose:
+            print('{} in cache'.format(cas))
+        return cache[cas]
+
+    results = pcp.get_synonyms(cas, 'name')
+
+    if len(results) == 0:
+        cas_num = None
+        cache[cas] = cas_num
+        return cas_num
+
+    r = results[0]
+    cas_number_candidates = []
+    for syn in r.get('Synonym', []):
+        match = re.match('(\d{2,7}-\d\d-\d)', syn)
+        if match:
+            cas_number_candidates.append(match.group(1))
+        # TODO so not every entry in pubchem has an associated CAS?
+
+    if len(cas_number_candidates) == 0:
+        if verbose:
+            print('No CAS numbers found online for {}'.format(cas))
+        cas_num = None
+
+    else:
+        cas_num = sorted(cas_number_candidates)[0]
+
+    cache[cas] = cas_num
     return cas_num
 
 
