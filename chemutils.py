@@ -36,6 +36,7 @@ manual_name2cas = {
 }
 
 
+# TODO allow configuration s.t. cache is disabled (env var?)?
 cache_file = os.path.expanduser('~/.chemutils_cache.p')
 if os.path.exists(cache_file):
     with open(cache_file, 'rb') as f:
@@ -48,6 +49,14 @@ def save_cache():
         pickle.dump(cache, f)
 
 atexit.register(save_cache)
+
+
+def delete_cache():
+    """Deletes the cache pickle at ~/.chemutils_cache.p
+    """
+    if os.path.exists(cache_file):
+        os.remove(cache_file)
+
 
 def name2cas(name, verbose=False):
     """Returns the CAS number for the chemical with the given name.
