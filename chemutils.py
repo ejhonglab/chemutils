@@ -40,7 +40,6 @@ cache_file = os.path.expanduser('~/.chemutils_cache.p')
 if os.path.exists(cache_file):
     with open(cache_file, 'rb') as f:
         cache = pickle.load(f)
-    print(cache)
 else:
     cache = dict()
 
