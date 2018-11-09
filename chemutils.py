@@ -36,26 +36,27 @@ manual_name2cas = {
 }
 
 
-# TODO allow configuration s.t. cache is disabled (env var?)?
+# TODO allow configuration s.t. to_cas_cache is disabled (env var?)?
 cache_file = os.path.expanduser('~/.chemutils_cache.p')
 if os.path.exists(cache_file):
     with open(cache_file, 'rb') as f:
-        cache = pickle.load(f)
+        to_cas_cache, to_name_cache = pickle.load(f)
 else:
-    cache = dict()
+    to_cas_cache = dict()
+    to_name_cache = dict()
 
 def save_cache():
     with open(cache_file, 'wb') as f:
-        pickle.dump(cache, f)
+        pickle.dump((to_cas_cache, to_name_cache), f)
 
 atexit.register(save_cache)
 
 
-def delete_cache():
-    """Deletes the cache pickle at ~/.chemutils_cache.p
+def delete_to_cas_cache():
+    """Deletes the to_cas_cache pickle at ~/.chemutils_to_cas_cache.p
     """
-    if os.path.exists(cache_file):
-        os.remove(cache_file)
+    if os.path.exists(to_cas_cache_file):
+        os.remove(to_cas_cache_file)
 
 
 def name2cas(name, verbose=False):
@@ -68,18 +69,19 @@ def name2cas(name, verbose=False):
     if name in manual_name2cas:
         return manual_name2cas[name]
 
-    if name in cache:
+    if name in to_cas_cache:
         if verbose:
-            print('{} in cache'.format(name))
-        return cache[name]
+            print('{} in to_cas_cache'.format(name))
+        return to_cas_cache[name]
 
     results = pcp.get_synonyms(name, 'name')
 
     if len(results) == 0:
         cas_num = None
-        cache[name] = cas_num
+        to_cas_cache[name] = cas_num
         return cas_num
 
+    # TODO TODO if results if len > 1, maybe err / warn
     r = results[0]
     cas_number_candidates = []
     for syn in r.get('Synonym', []):
@@ -96,26 +98,26 @@ def name2cas(name, verbose=False):
     else:
         cas_num = sorted(cas_number_candidates)[0]
 
-    cache[name] = cas_num
+    to_cas_cache[name] = cas_num
     return cas_num
 
 
 def cas2cas(cas, verbose=False):
     """
     """
-    # Can share cache w/ name2cache since function range is the same.
-    if cas in cache:
+    if cas in to_cas_cache:
         if verbose:
-            print('{} in cache'.format(cas))
-        return cache[cas]
+            print('{} in to_cas_cache'.format(cas))
+        return to_cas_cache[cas]
 
     results = pcp.get_synonyms(cas, 'name')
 
     if len(results) == 0:
         cas_num = None
-        cache[cas] = cas_num
+        to_cas_cache[cas] = cas_num
         return cas_num
 
+    # TODO TODO if results if len > 1, maybe err
     r = results[0]
     cas_number_candidates = []
     for syn in r.get('Synonym', []):
@@ -132,8 +134,31 @@ def cas2cas(cas, verbose=False):
     else:
         cas_num = sorted(cas_number_candidates)[0]
 
-    cache[cas] = cas_num
+    to_cas_cache[cas] = cas_num
     return cas_num
+
+
+def cas2name(cas, verbose=False):
+    """
+    """
+    if cas in to_name_cache:
+        if verbose:
+            print('{} in to_name_cache'.format(cas))
+        return to_name_cache[cas]
+
+    results = pcp.get_compounds(cas, 'name')
+
+    if len(results) == 0:
+        name = None
+        to_name_cache[cas] = name
+        return name
+
+    # TODO TODO if results if len > 1, maybe err
+    r = results[0]
+    name = r.iupac_name
+
+    to_name_cache[cas] = name
+    return name
 
 
 if __name__ == '__main__':
