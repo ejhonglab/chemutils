@@ -3,6 +3,8 @@ import re
 import os
 import pickle
 import atexit
+import urllib.error
+import warnings
 
 import pubchempy as pcp
 
@@ -40,23 +42,24 @@ manual_name2cas = {
 cache_file = os.path.expanduser('~/.chemutils_cache.p')
 if os.path.exists(cache_file):
     with open(cache_file, 'rb') as f:
-        to_cas_cache, to_name_cache = pickle.load(f)
+        to_cas_cache, to_name_cache, to_inchi_cache = pickle.load(f)
 else:
     to_cas_cache = dict()
     to_name_cache = dict()
+    to_inchi_cache = dict()
 
 def save_cache():
     with open(cache_file, 'wb') as f:
-        pickle.dump((to_cas_cache, to_name_cache), f)
+        pickle.dump((to_cas_cache, to_name_cache, to_inchi_cache), f)
 
 atexit.register(save_cache)
 
 
-def delete_to_cas_cache():
+def delete_cache():
     """Deletes the to_cas_cache pickle at ~/.chemutils_to_cas_cache.p
     """
-    if os.path.exists(to_cas_cache_file):
-        os.remove(to_cas_cache_file)
+    if os.path.exists(cache_file):
+        os.remove(cache_file)
 
 
 def name2cas(name, verbose=False):
@@ -66,6 +69,9 @@ def name2cas(name, verbose=False):
     (as sorted by Python string comparison) is returned, so the answer should at
     least be consistent.
     """
+    if name is None:
+        return None
+
     if name in manual_name2cas:
         return manual_name2cas[name]
 
@@ -74,7 +80,11 @@ def name2cas(name, verbose=False):
             print('{} in to_cas_cache'.format(name))
         return to_cas_cache[name]
 
-    results = pcp.get_synonyms(name, 'name')
+    try:
+        results = pcp.get_synonyms(name, 'name')
+    except urllib.error.URLError as e:
+        warnings.warn('{}\nReturning None.'.format(e))
+        return None
 
     if len(results) == 0:
         cas_num = None
@@ -105,12 +115,19 @@ def name2cas(name, verbose=False):
 def cas2cas(cas, verbose=False):
     """
     """
+    if cas is None:
+        return None
+
     if cas in to_cas_cache:
         if verbose:
             print('{} in to_cas_cache'.format(cas))
         return to_cas_cache[cas]
 
-    results = pcp.get_synonyms(cas, 'name')
+    try:
+        results = pcp.get_synonyms(cas, 'name')
+    except urllib.error.URLError as e:
+        warnings.warn('{}\nReturning None.'.format(e))
+        return None
 
     if len(results) == 0:
         cas_num = None
@@ -141,12 +158,19 @@ def cas2cas(cas, verbose=False):
 def cas2name(cas, verbose=False):
     """
     """
+    if cas is None:
+        return None
+
     if cas in to_name_cache:
         if verbose:
             print('{} in to_name_cache'.format(cas))
         return to_name_cache[cas]
 
-    results = pcp.get_compounds(cas, 'name')
+    try:
+        results = pcp.get_compounds(cas, 'name')
+    except urllib.error.URLError as e:
+        warnings.warn('{}\nReturning None.'.format(e))
+        return None
 
     if len(results) == 0:
         name = None
@@ -161,6 +185,27 @@ def cas2name(cas, verbose=False):
     return name
 
 
+# TODO TODO cache (provide consist interface for this...)
+def inchikey2inchi(inchikey):
+    """
+    """
+    if len(inchikey) != 27:
+        # TODO or is it 14? wikipedia seems to have conflicting information
+        # 14 from hash of connectivity + hyphen + 8 from hash of other layers
+        # + single character indicating kind of inchikey + single char
+        # indicating inchi version + hyphen + char for protonation?
+        raise ValueError('InChI Keys are 27 characters long')
+
+    results = pcp.get_compounds(inchikey, 'inchikey')
+    assert len(results) == 1
+
+    result = results[0]
+    assert inchi.startswith('InChI=')
+    inchi = result[6:]
+
+    return inchi
+
+
 if __name__ == '__main__':
     import pandas as pd
 
@@ -172,4 +217,7 @@ if __name__ == '__main__':
     for name in data['Chemical']:
         cas = name2cas(name)
         print(name, cas)
+
+    # TODO seems rdkit wants the 'InChI=' prefix
+    inchi = '1S/C3H8O/c1-2-3-4/h4H,2-3H2,1H3'
 
