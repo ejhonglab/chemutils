@@ -4,16 +4,18 @@
 # can use this to check boost version is sufficient
 # dpkg -s libboost-dev | grep 'Version'
 
-sudo apt-get install flex bison build-essential python-numpy cmake python-dev sqlite3 libsqlite3-dev libboost-dev  libboost-python-dev libboost-regex-dev
+#sudo apt-get install flex bison build-essential python-numpy cmake python-dev sqlite3 libsqlite3-dev libboost-dev  libboost-python-dev libboost-regex-dev
 
-git clone git://github.com/rdkit/rdkit.git
+cd ~/src
+#git clone git://github.com/rdkit/rdkit.git
 
-echo "\n# For rdkit cheminformatics library" >> ~/.bashrc
-echo "export RDBASE=\$HOME/src/rdkit" >> ~/.bashrc
-echo "export LD_LIBRARY_PATH=\$RDBASE/lib:\$LD_LIBRARY_PATH" >> ~/.bashrc
-echo "export PYTHONPATH=\$RDBASE:\$PYTHONPATH" >> ~/.bashrc
+printf "\n\n# For rdkit cheminformatics library\n" >> ~/.bashrc
+printf "export RDBASE=\$HOME/src/rdkit\n" >> ~/.bashrc
+printf "export LD_LIBRARY_PATH=\$RDBASE/lib:\$LD_LIBRARY_PATH\n" >> ~/.bashrc
+printf "export PYTHONPATH=\$RDBASE:\$PYTHONPATH\n\n" >> ~/.bashrc
+. ~/.bashrc
 
-cd External/INCHI-API/
+cd rdkit/External/INCHI-API/
 ./download-inchi.sh
 cd ../..
 
