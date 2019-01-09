@@ -7,6 +7,7 @@ import urllib.error
 import warnings
 
 import pubchempy as pcp
+import pandas as pd
 
 
 # Procedure for entering CAS numbers in here (follow this to maintain
@@ -71,6 +72,8 @@ def name2cas(name, verbose=False):
     """
     if name is None:
         return None
+    elif pd.isnull(name):
+        return name
 
     if name in manual_name2cas:
         return manual_name2cas[name]
@@ -117,6 +120,8 @@ def cas2cas(cas, verbose=False):
     """
     if cas is None:
         return None
+    elif pd.isnull(cas):
+        return cas
 
     if cas in to_cas_cache:
         if verbose:
@@ -160,6 +165,8 @@ def cas2name(cas, verbose=False):
     """
     if cas is None:
         return None
+    elif pd.isnull(cas):
+        return cas
 
     if cas in to_name_cache:
         if verbose:
@@ -189,6 +196,9 @@ def cas2name(cas, verbose=False):
 def inchikey2inchi(inchikey):
     """
     """
+    if pd.isnull(inchikey):
+        return inchikey
+
     if len(inchikey) != 27:
         # TODO or is it 14? wikipedia seems to have conflicting information
         # 14 from hash of connectivity + hyphen + 8 from hash of other layers
