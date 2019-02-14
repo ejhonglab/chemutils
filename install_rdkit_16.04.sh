@@ -7,7 +7,7 @@
 #sudo apt-get install flex bison build-essential python-numpy cmake python-dev sqlite3 libsqlite3-dev libboost-dev  libboost-python-dev libboost-regex-dev
 
 cd ~/src
-#git clone git://github.com/rdkit/rdkit.git
+git clone git://github.com/rdkit/rdkit.git
 
 printf "\n\n# For rdkit cheminformatics library\n" >> ~/.bashrc
 printf "export RDBASE=\$HOME/src/rdkit\n" >> ~/.bashrc
@@ -22,7 +22,7 @@ cd ../..
 mkdir build
 cd build
 
-cmake -DRDK_BUILD_INCHI_SUPPORT=ON -DPYTHON_LIBRARY=/usr/lib/python3.5/config-3.5m-x86_64-linux-gnu/libpython3.5m-pic.a -DPYTHON_INCLUDE_DIR=/usr/include/python3.5/ -DPYTHON_EXECUTABLE=/usr/bin/python3 ..
+cmake -DRDK_BUILD_INCHI_SUPPORT=ON -DPy_ENABLE_SHARED=1 -DPYTHON_LIBRARY=/usr/lib/python3.5/config-3.5m-x86_64-linux-gnu/libpython3.5m-pic.a -DPYTHON_INCLUDE_DIR=/usr/include/python3.5/ -DPYTHON_EXECUTABLE=/usr/bin/python3 ..
 make -j4
 make install
 

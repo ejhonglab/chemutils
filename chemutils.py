@@ -39,29 +39,62 @@ manual_name2cas = {
 }
 
 
-# TODO allow configuration s.t. to_cas_cache is disabled (env var?)?
 cache_file = os.path.expanduser('~/.chemutils_cache.p')
-if os.path.exists(cache_file):
-    with open(cache_file, 'rb') as f:
-        to_cas_cache, to_name_cache, to_inchi_cache = pickle.load(f)
-else:
-    to_cas_cache = dict()
-    to_name_cache = dict()
-    to_inchi_cache = dict()
-
-def save_cache():
-    with open(cache_file, 'wb') as f:
-        pickle.dump((to_cas_cache, to_name_cache, to_inchi_cache), f)
-
-atexit.register(save_cache)
-
 
 def delete_cache():
     """Deletes the to_cas_cache pickle at ~/.chemutils_to_cas_cache.p
     """
+    global to_cas_cache
+    global to_name_cache
+    global to_inchi_cache
+    global to_smiles_cache
+
+    to_cas_cache = dict()
+    to_name_cache = dict()
+    to_inchi_cache = dict()
+    to_smiles_cache = dict()
+
     if os.path.exists(cache_file):
         os.remove(cache_file)
 
+
+# TODO change cache to save sub-caches as values behind their names
+# so that loading can load an older cache w/o all the keys
+# TODO allow configuration s.t. to_cas_cache is disabled (env var?)?
+if os.path.exists(cache_file):
+    try:
+        with open(cache_file, 'rb') as f:
+            to_cas_cache, to_name_cache, to_inchi_cache, to_smiles_cache = \
+                pickle.load(f)
+
+    except ValueError:
+        print('Cache was in unreadable format. Deleting.')
+        delete_cache()
+
+else:
+    to_cas_cache = dict()
+    to_name_cache = dict()
+    to_inchi_cache = dict()
+    to_smiles_cache = dict()
+
+def save_cache():
+    with open(cache_file, 'wb') as f:
+        pickle.dump((to_cas_cache, to_name_cache, to_inchi_cache,
+            to_smiles_cache), f)
+
+atexit.register(save_cache)
+
+
+def clear_inchi_cache():
+    """Just clears the InChI cache.
+    """
+    global to_inchi_cache
+    to_inchi_cache = dict()
+    save_cache()
+
+
+# TODO probably try to factor all of these fns into one to get into normalized
+# representation and another to get a desired property from that
 
 def name2cas(name, verbose=False):
     """Returns the CAS number for the chemical with the given name.
@@ -184,12 +217,81 @@ def cas2name(cas, verbose=False):
         to_name_cache[cas] = name
         return name
 
-    # TODO TODO if results if len > 1, maybe err
+    # TODO TODO if results len > 1, maybe err
     r = results[0]
     name = r.iupac_name
 
     to_name_cache[cas] = name
     return name
+
+
+def name2compound(name, verbose=False):
+    try:
+        results = pcp.get_synonyms(name, 'name')
+    except urllib.error.URLError as e:
+        warnings.warn('{}\nReturning None.'.format(e))
+        return None
+
+    if len(results) == 0:
+        return None
+
+    # TODO TODO if results len > 1, maybe err
+    cid = results[0]['CID']
+    # TODO way to go direct to Compound?
+    compound = pcp.Compound.from_cid(cid)
+    return compound
+
+
+def name2inchi(name, verbose=True):
+    """
+    """
+    if pd.isnull(name):
+        return name
+
+    if name in to_inchi_cache:
+        if verbose:
+            print('{} in to_inchi_cache'.format(name))
+        return to_inchi_cache[name]
+
+    compound = name2compound(name)
+
+    if compound is None:
+        inchi = None
+        to_inchi_cache[name] = inchi
+        return inchi
+
+    inchi = compound.inchi
+    # TODO sometimes, is it just the prefix?
+    assert inchi.startswith('InChI=')
+    inchi = inchi[6:]
+    # TODO actually check format meets some minimum of the inchi standard
+    assert len(inchi) > 0
+
+    to_inchi_cache[name] = inchi
+    return inchi
+
+
+def name2smiles(name, verbose=False):
+    if pd.isnull(name):
+        return name
+
+    if name in to_smiles_cache:
+        if verbose:
+            print('{} in to_smiles_cache'.format(name))
+        return to_smiles_cache[name]
+
+    compound = name2compound(name)
+
+    if compound is None:
+        smiles = None
+        to_smiles_cache[name] = smiles
+        return smiles
+
+    # TODO diff between this and isomeric_smiles ?
+    smiles = compound.canonical_smiles
+
+    to_smiles_cache[name] = smiles
+    return smiles
 
 
 # TODO TODO cache (provide consist interface for this...)
@@ -210,7 +312,9 @@ def inchikey2inchi(inchikey):
     assert len(results) == 1
 
     result = results[0]
-    assert inchi.startswith('InChI=')
+    raise NotImplementedError
+    # TODO TODO fix error (not defined)
+    assert r.inchi.startswith('InChI=')
     inchi = result[6:]
 
     return inchi
