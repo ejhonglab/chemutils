@@ -145,8 +145,8 @@ def delete_cache():
     if os.path.exists(cache_file):
         os.remove(cache_file)
 
-
-delete_cache()
+#delete_oldcache()
+#delete_cache()
 if os.path.exists(cache_file):
     try:
         with open(cache_file, 'rb') as f:
@@ -185,11 +185,28 @@ def clear_inchi_cache():
 #
 
 
-def convert(chem_id, from_type=None, to_type='inchi', verbose=False):
+# TODO TODO TODO some fn to strip chirality information from inchi for further
+# normalization
+# 1) possible?
+# 2) always what we want (i.e. does the biology only make one sometimes / can we
+# actually separate some on our column?)?
+# 3) usually what we want?
+
+
+def convert(chem_id, from_type=None, to_type='inchi', verbose=False,
+    allow_nan=False, ignore_cache=False):
+
     equivalent_col_names = {
         'odor': 'name',
         'cas_number': 'cas'
     }
+    def conversion_fail_errmsg():
+        return 'Conversion from {} to {} failed for'.format(from_type, to_type)
+
+    def conversion_fail_err():
+        msg = conversion_fail_errmsg() + ' {}'.format(chem_id)
+        raise ValueError(msg)
+
     # TODO test w/ index/series/df (w/ index / columns of matching name)
     if hasattr(chem_id, 'shape') and len(chem_id.shape) > 0:
         if to_type in equivalent_col_names:
@@ -208,15 +225,45 @@ def convert(chem_id, from_type=None, to_type='inchi', verbose=False):
                 if from_type in equivalent_col_names:
                     from_type = equivalent_col_names[from_type]
 
+            # Mostly for recursion from DataFrame case.
+            if from_type not in chem_id_types:
+                if verbose:
+                    print('from_type {} not recognized. not converting.'.format(
+                        from_type))
+                return chem_id
+
+            # Forcing allow_nan to True so we can report each of the failing
+            # lookups.
             fn = lambda x: convert(x, from_type=from_type, to_type=to_type,
-                verbose=verbose)
+                verbose=verbose, ignore_cache=ignore_cache, allow_nan=True)
 
             # TODO test each of these cases
+            # TODO also test w/ passing / failing allow_nan case for each
             # This means it was a Series, not an Index.
+            # TODO TODO which case do i actually want to support:
+            # series w/ values to convert in index, or w/ them as the value of
+            # the series???? either?
             if hasattr(chem_id, 'index'):
-                return chem_id.rename(fn).rename(to_name)
+                raise NotImplementedError
+                converted = chem_id.rename(fn).rename(to_name)
+                to_check = chem_id.index
             else:
-                return chem_id.map(fn)
+                converted = chem_id.map(fn)
+                converted.name = to_type
+                to_check = converted
+
+            missing = to_check.isnull()
+            if not allow_nan and missing.any():
+                err_str = conversion_fail_errmsg() + ':\n'
+                err_str = 'Conversion from {} to {} failed for:\n'.format(
+                    from_type, to_type)
+
+                for m in chem_id[missing]:
+                    err_str += str(m) + '\n'
+
+                raise ValueError(err_str)
+
+            return converted
 
         # This covers DataFrames
         elif len(chem_id.shape) == 2:
@@ -227,11 +274,13 @@ def convert(chem_id, from_type=None, to_type='inchi', verbose=False):
                     'supported for DataFrames')
 
             df = chem_id.copy()
-            # TODO TODO TODO just make sure that this functions as a no-op if
-            # convert would otherwise fail (maybe add a kwarg flag to cause this
-            # behavior that is only used here?)
-            df.index = convert(df.index, to_type=to_type, verbose=verbose)
-            df.columns = convert(df.index, to_type=to_type, verbose=verbose)
+            # TODO maybe pass all kwargs at once some way
+            df.index = convert(df.index, to_type=to_type, verbose=verbose,
+                allow_nan=allow_nan, ignore_cache=ignore_cache)
+            df.columns = convert(df.columns, to_type=to_type, verbose=verbose,
+                allow_nan=allow_nan, ignore_cache=ignore_cache)
+            return df
+
         else:
             raise ValueError('unexpected number of dimensions')
 
@@ -242,23 +291,48 @@ def convert(chem_id, from_type=None, to_type='inchi', verbose=False):
     if from_type in equivalent_col_names:
         from_type = equivalent_col_names[from_type]
 
+    if verbose:
+        print('Trying to convert {} from {} to {}'.format(
+            chem_id, from_type, to_type))
+
     if pd.isnull(chem_id):
         return chem_id
 
     # TODO unit test each of these cases, including None handling
 
-    if chem_id in cache[from_type][to_type]:
-        return cache[from_type][to_type][chem_id]
-    
-    if chem_id in cache[from_type]['cid']:
+    norm_fn_name = 'normalize_' + from_type
+    if norm_fn_name in globals():
+        old_chem_id = chem_id
+        chem_id = globals()[norm_fn_name](chem_id)
+        if verbose and old_chem_id != chem_id:
+            print('{}({}) -> {}'.format(norm_fn_name, old_chem_id, chem_id))
+
+    if not ignore_cache:
+        if chem_id in cache[from_type][to_type]:
+            val = cache[from_type][to_type][chem_id]
+            if verbose:
+                print('Returning {} from cache'.format(val))
+            return val
+
+    if not ignore_cache and chem_id in cache[from_type]['cid']:
         cid = cache[from_type]['cid'][chem_id]
+        if verbose:
+            print('{} of type {} had CID {} in cache'.format(chem_id, from_type,
+                cid))
         if cid is None:
+            if verbose:
+                print('CID in cache was None!')
+            if not allow_nan:
+                conversion_fail_err()
             return None
     else:
         f2cid_fn_name = from_type + '2cid'
         if f2cid_fn_name not in globals():
             raise NotImplementedError(('define function {} to support ' +
                 'conversion from type {}').format(f2cid_fn_name, from_type))
+
+        if verbose:
+            print('Calling CID lookup function', f2cid_fn_name)
 
         cid = globals()[f2cid_fn_name](chem_id)
         if cid is None:
@@ -271,7 +345,15 @@ def convert(chem_id, from_type=None, to_type='inchi', verbose=False):
                 # To not overwrite hardcoded values for other types.
                 if chem_id not in to_type_cache:
                     to_type_cache[chem_id] = None
+
+            if not allow_nan:
+                conversion_fail_err()
+
             return None
+
+        if verbose:
+            print('CID={}'.format(cid))
+
         cache[from_type]['cid'][chem_id] = cid
 
     # TODO TODO should i also support some way of directly going from from_type
@@ -296,12 +378,20 @@ def convert(chem_id, from_type=None, to_type='inchi', verbose=False):
             # To not overwrite hardcoded values for other types.
             if chem_id not in to_type_dict:
                 to_type_dict[chem_id] = None
+
+        if not allow_nan:
+            conversion_fail_err()
+
         return None
 
     compound2t_fn_name = 'compound2' + to_type
     if compound2t_fn_name not in globals():
         raise NotImplementedError(('define function {} to support ' +
             'conversion to type {}').format(compound2t_fn_name, to_type))
+
+    if verbose:
+        print('Calling function {} to get {} from Compound'.format(
+            compound2t_fn_name, to_type))
 
     to_type_val = globals()[compound2t_fn_name](compound)
     cache[from_type][to_type][chem_id] = to_type_val
@@ -310,7 +400,42 @@ def convert(chem_id, from_type=None, to_type='inchi', verbose=False):
         print('Conversion of {} from Compound to {} failed!'.format(
             chem_id, to_type))
 
+        if not allow_nan:
+            conversion_fail_err()
+
     return to_type_val
+
+
+def normalize_name(name):
+    parts = name.split()
+    normed_name = parts[0]
+    for a, b in zip(parts, parts[1:]):
+        # We don't want to join adjacent words.
+        if a[-1].isalpha() and b[0].isalpha():
+            b = ' ' + b
+        normed_name += b
+
+    corrections = {
+        'linalool oxide': 'trans-linalool oxide',
+        '4-ethyl guaiacol': '4-ethylguaiacol'
+    }
+    if normed_name in corrections:
+        return corrections[normed_name]
+
+    prefix_corrections = {
+        'a-': 'alpha-',
+        'b-': 'beta-',
+        'g-': 'gamma-',
+        'E2-': '(E)-2-',
+        'E3-': '(E)-3-',
+        'Z2-': '(Z)-2-',
+        'Z3-': '(Z)-3-',
+    }
+    for p, c in prefix_corrections.items():
+        if normed_name.startswith(p):
+            normed_name = c + normed_name[len(p):]
+
+    return normed_name
 
 
 # TODO maybe also take fns <type>2results or something? which always gets
@@ -325,6 +450,15 @@ def name2cid(name, verbose=False):
         return None
 
     if len(results) == 0:
+        # TODO delete
+        # TODO are there substances w/o cids? search for those too?
+        '''
+        substances = pcp.get_substances(name, 'name')
+        substance_cids = pcp.get_cids(name, 'name', 'substance')
+        #assert len(substance_cids) == 0
+        import ipdb; ipdb.set_trace()
+        '''
+        #
         return None
 
     # TODO TODO if results len > 1, maybe err
@@ -337,6 +471,8 @@ def cas2cid(cas, verbose=False):
         # difference?
         # TODO TODO TODO if no difference, call name2cid here, as otherwise they
         # are the same
+        # TODO and maybe if i'm using get_compounds, make this a cas2compound
+        # fn or something, and skip the compound.from_cid step?
         results = pcp.get_compounds(cas, 'name')
     except urllib.error.URLError as e:
         warnings.warn('{}\nReturning None.'.format(e))
@@ -344,8 +480,13 @@ def cas2cid(cas, verbose=False):
 
     if len(results) == 0:
         # TODO delete
+        '''
         r2 = pcp.get_synonyms(cas, 'name')
-        import ipdb; ipdb.set_trace()
+        assert len(r2) == 0
+        # TODO are there substances w/o cids? search for those too?
+        substance_cids = pcp.get_cids(cas, 'name' 'substance')
+        assert len(substance_cids) == 0
+        '''
         #
         return None
 
@@ -446,7 +587,24 @@ def name2cas(name, verbose=False):
         cas_num = None
 
     else:
+        # TODO maybe taking the lowest number CAS makes the most sense?
+        # (moreso than just sorting at least?) (key on first part? matter?)
         cas_num = sorted(cas_number_candidates)[0]
+
+    # TODO delete
+    name_from_inverse = cas2name(cas_num)
+    if pd.isnull(name_from_inverse):
+        print('original name:', name)
+        print('CAS from lookup:', cas_num)
+        print('inverting cas number back to name failed!')
+        import ipdb; ipdb.set_trace()
+    '''
+    elif name_from_inverse != name:
+        print('inverse name did not match original name!')
+        print('original name:', name)
+        print('name from inverse:', name_from_inverse)
+    '''
+    #
 
     to_cas_cache[name] = cas_num
     return cas_num
