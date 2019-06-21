@@ -5,6 +5,7 @@ import pickle
 import atexit
 import urllib.error
 import warnings
+from collections import Counter
 
 import pubchempy as pcp
 import pandas as pd
@@ -97,6 +98,9 @@ manual_type2null_keys = {
         'odor'
     }
 }
+# TODO TODO try deleting / ignoring this hardcoded stuff and see if it still
+# works. my changes to normalize_name probably fixed a few of these cases.
+# (and if it can be ignored, delete it)
 manual = {
     'name': {
         'cas': {
@@ -133,46 +137,49 @@ manual = {
 # 3) other (good default available in pubchempy? probably not iupac...)
 
 
-def init_cache():
-    global cache
-    cache = {ft: {tt: dict() for tt in chem_id_types} for ft in chem_id_types}
-
-
-def add_manual_overrides():
-    global cache
-
+def add_manual_overrides(_cache):
     for ft, null_keys in manual_type2null_keys.items():
         for nk in null_keys:
             for tt in chem_id_types:
-                cache[ft][tt][nk] = None
+                _cache[ft][tt][nk] = None
 
     for ft, tts in manual.items():
         for tt in tts:
-            cache[ft][tt].update(tts[tt])
+            _cache[ft][tt].update(tts[tt])
+
+
+def init_cache():
+    _cache = {ft: {tt: dict() for tt in chem_id_types} for ft in chem_id_types}
+    add_manual_overrides(_cache)
+    return _cache
+
+
+def clear_cache():
+    global cache
+    cache = init_cache()
 
 
 def delete_cache():
     """Deletes and clears the cache at cache_file
     """
-    global cache
-    init_cache()
+    clear_cache()
     if os.path.exists(cache_file):
         os.remove(cache_file)
 
 
-#delete_oldcache()
-#delete_cache()
-if os.path.exists(cache_file):
-    try:
-        with open(cache_file, 'rb') as f:
-            cache = pickle.load(f)
-        # TODO TODO overwrite w/ manual stuff here?
-    except ValueError:
-        print('Cache was in unreadable format. Deleting.')
-        delete_cache()
-else:
-    init_cache()
-add_manual_overrides()
+def load_cache():
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file, 'rb') as f:
+                _cache = pickle.load(f)
+            return _cache
+        except ValueError:
+            print('Cache was in unreadable format. Deleting.')
+            delete_cache()
+            # Will have already been init'd in delete_cache call.
+            return cache
+    else:
+        return init_cache()
 
 
 def save_oldcache():
@@ -182,22 +189,93 @@ def save_oldcache():
 
 
 def save_cache():
+    """
+    Load old cache first, so that clear_cache doesn't have to worry about
+    screwing up on-disk cache when atexit call to save_cache triggers.
+    """
+    # TODO need "global cache", as long as cache def is below fn def, or what?
+    # if that's all, move "cache = load_cache()" just above this, and declare
+    # as global in load_cache, cause circularity
+    old_cache = load_cache()
+    # So any current values overwrite old_cache values.
+    old_cache.update(cache)
+    
     with open(cache_file, 'wb') as f:
-        pickle.dump(cache, f)
+        pickle.dump(old_cache, f)
 
 
+# TODO test
+cache = load_cache()
 atexit.register(save_oldcache)
 atexit.register(save_cache)
 
 
-# TODO why did i have this? delete...
-def clear_inchi_cache():
-    """Just clears the InChI cache.
-    """
-    global to_inchi_cache
-    to_inchi_cache = dict()
-    save_oldcache()
-#
+# From Wikipedia page on InChI
+_t_ster = 'tetrahedral stereochemistry of atoms and allenes'
+inchi_prefix2layer = {
+    'c': 'atom connections',
+    'h': 'hydrogen atoms',
+    'p': 'proton sublayer',
+    'q': 'charge sublayer',
+    'b': 'double bonds and cumulenes',
+    # TODO do t and m differ in any particular way?
+    't': _t_ster,
+    'm': _t_ster,
+    's': 'type of stereochemistry information',
+    # b,t,m,s[,h] can all also have isotopic information for
+    # "isotopic stereochemistry"
+    'i': 'isotopic layer',
+    # 'may end with "o" sublayer; never included in standard InChI'
+    # what is "o" sublayer?
+    'f': 'fixed-H layer',
+    # also never in standard InChI
+    'r': 'reconnected metal atoms layer'
+}
+
+
+def basic_inchi(inchi, include_h=True):
+    parts = inchi.split('/')
+    # TODO do i want h? can this information not be mostly / entirely inferred?
+    # TODO actually, when is h layer NOT included in my data?
+    if include_h:
+        keep = {'c','h','b'}
+    else:
+        keep = {'c','b'}
+    return '/'.join(parts[:2] + [p for p in parts[2:] if p[0] in keep])
+
+
+def inchi_layers(inchi):
+    # First part should just be 1 or 1S (for "standard InChI")
+    # Second part is the chemical formula w/o a prefix.
+    prefixes = [x[0] for x in inchi.split('/')[2:]]
+    layers = [inchi_prefix2layer[p] for p in prefixes]
+    return layers
+
+
+def inchi_layer_set(inchis):
+    from functools import reduce
+    # TODO why again can list 'sum' be taken directly by agg but
+    # set.union can't? way to reference list sum as set.union is ref'd?
+    union = lambda x: reduce(set.union, x)
+    return inchis.apply(lambda x: set(inchi_layers(x))).agg(union)
+
+
+# TODO better name?
+# TODO TODO TODO implement. groupby stripped ids -> show name + other cols for
+# groups w/ more than one non-stripped per
+''
+def inchi_diff_in_details(df):
+    df.copy(
+'''
+
+
+# TODO why does "tetrahedral stereochemistry of atoms and allenes" layer
+# show up more than "double bonds..."?
+# TODO maybe draw structures with / without this info (if possible) to see what
+# information it contains?
+def count_inchi_layers(inchis):
+    counts = Counter(inchis.apply(inchi_layers).agg('sum'))
+    return counts
 
 
 # TODO TODO TODO some fn to strip chirality information from inchi for further
@@ -214,6 +292,9 @@ def convertable(chem_id_type):
     return False
 
 
+# TODO in ignore_cache case, still make a interpreter run / call specific
+# cache, or like de-dupe and re-dupe, so as to still test new behavior, but also
+# not waste time. (not as much of a priority if clear_cache approach works)
 def convert(chem_id, from_type=None, to_type='inchi', verbose=False,
     allow_nan=False, allow_conflicts=True, ignore_cache=False, exclude_cols=[],
     already_normalized=False, drop_na=True, report_missing=True):
@@ -388,6 +469,14 @@ def convert(chem_id, from_type=None, to_type='inchi', verbose=False,
                     lambda x: x.dropna().unique(), axis=1)
                 # TODO use that str len fn?
                 conflicts = values.apply(lambda x: len(x) > 1)
+
+                # TODO maybe in the case that to_type=inchi, say which layers
+                # differ in conflict?
+
+                # TODO TODO TODO maybe provide some indicator column that says
+                # which ID was ultimately used (either highest priority of those
+                # that agreed, or the whole set that agreed), for
+                # troubleshooting other normalization problems
 
                 # TODO TODO test that this is actually respecting priority
                 df[to_type] = values.apply(
@@ -617,13 +706,18 @@ def normalize_cas(cas):
     return normed_cas
 
 
+def print_pubchem_link(cid):
+    print('https://pubchem.ncbi.nlm.nih.gov/compound/{}'.format(cid))
+
+
 # TODO maybe also take fns <type>2results or something? which always gets
 # CID as here? probably not worth it...
 def name2cid(name, verbose=False):
     try:
         # TODO TODO should this have been get_compounds, as in cas2name above?
         # what's the difference?
-        results = pcp.get_synonyms(name, 'name')
+        #results = pcp.get_synonyms(name, 'name')
+        results = pcp.get_compounds(name, 'name')
     except urllib.error.URLError as e:
         warnings.warn('{}\nReturning None.'.format(e))
         return None
@@ -640,16 +734,35 @@ def name2cid(name, verbose=False):
         #
         return None
 
-    # TODO TODO if results len > 1, maybe err
-    return results[0]['CID']
+    # TODO delete / pick some other strategy if this isn't always true
+    # (yes, this does fail sometimes)
+    ######assert len(results) == 1 
+    if len(results) > 1:
+        # TODO TODO TODO focus on cases where there are multiple
+        # fewest-InChI-layer-results, and figure out whether / what
+        # other strategies are necessary to resolve results
+        print('Got multiple results from name={}:'.format(name))
+        n_inchi_parts = [len(r.inchi.split('/')) for r in results]
+        fewest_inchi_parts = sorted(n_inchi_parts)[0]
+        counts = Counter(n_inchi_parts)
+        print('Fewest InChI parts: {}'.format(fewest_inchi_parts))
+        print('# InChIs w/ that many parts: {}'.format(
+            counts[fewest_inchi_parts]))
+        print(counts)
+        for r in results:
+            print(r.inchi)
+            print_pubchem_link(r.cid)
+        print('')
+    #
+
+    #return results[0]['CID']
+    return results[0].cid
 
 
+# TODO perhaps just call name2cid here, unless we have to take different
+# strategies to deal w/ len(results) > 1 case, if and when that happens
 def cas2cid(cas, verbose=False):
     try:
-        # TODO TODO why get_compounds rather than get_synonyms here? what's the
-        # difference?
-        # TODO TODO TODO if no difference, call name2cid here, as otherwise they
-        # are the same
         # TODO and maybe if i'm using get_compounds, make this a cas2compound
         # fn or something, and skip the compound.from_cid step?
         results = pcp.get_compounds(cas, 'name')
@@ -669,11 +782,26 @@ def cas2cid(cas, verbose=False):
         #
         return None
 
-    # TODO TODO if results len > 1, maybe err
-
-    # TODO why did this seem to work in one other case?
-    # is this one of / the only synonyms / compounds difference?
-    #return results[0]['CID']
+    # TODO delete / pick some other strategy if this isn't always true
+    # damn... even this one fails sometimes
+    #assert len(results) == 1 
+    if len(results) > 1:
+        # TODO TODO TODO focus on cases where there are multiple
+        # fewest-InChI-layer-results, and figure out whether / what
+        # other strategies are necessary to resolve results
+        print('Got multiple results from CAS={}'.format(cas))
+        n_inchi_parts = [len(r.inchi.split('/')) for r in results]
+        fewest_inchi_parts = sorted(n_inchi_parts)[0]
+        counts = Counter(n_inchi_parts)
+        print('Fewest InChI parts: {}'.format(fewest_inchi_parts))
+        print('# InChIs w/ that many parts: {}'.format(
+            counts[fewest_inchi_parts]))
+        print(counts)
+        for r in results:
+            print(r.inchi)
+            print_pubchem_link(r.cid)
+        print('')
+    #
     return results[0].cid
 
 
