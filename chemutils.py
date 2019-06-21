@@ -75,14 +75,20 @@ else:
     to_smiles_cache = dict()
 
 
+# In descending order of the certainty each ID provides as to whether we found
+# the right PubChem entry.
 chem_id_types = [
-    'name',
-    'cas',
-    'inchi',
+    'cid',
     'inchikey',
+    'inchi',
     'smiles',
-    'cid'
+    'cas',
+    'name'
 ]
+equivalent_col_names = {
+    'odor': 'name',
+    'cas_number': 'cas'
+}
 # No matter the type these are to be converted to, they will always return a
 # null value. (maybe handle some other way?)
 manual_type2null_keys = {
@@ -91,12 +97,11 @@ manual_type2null_keys = {
         'odor'
     }
 }
-# TODO TODO TODO just have manual keys override values saved in cache when cache
-# is loaded, to never have to explicitly refer to the separate hardcoded stuff
 manual = {
     'name': {
         'cas': {
             # TODO TODO TODO deal w/ linalool (or maybe at cid level?)
+            # (it was some spelling that's not the one below)
             'g-hexalactone': '57129-70-1',
             'g-octalactone': '104-50-7',
             'g-decalactone': '1336-42-1',
@@ -117,6 +122,15 @@ manual = {
         }
     }
 }
+
+
+# TODO TODO move inventory loading here? (maybe w/o specific link?)
+
+# TODO TODO conversion to names with a priority on various sources:
+# [0) hardcoded stuff]
+# 1) names in inventory
+# 2) hallem
+# 3) other (good default available in pubchempy? probably not iupac...)
 
 
 def init_cache():
@@ -144,6 +158,7 @@ def delete_cache():
     init_cache()
     if os.path.exists(cache_file):
         os.remove(cache_file)
+
 
 #delete_oldcache()
 #delete_cache()
@@ -193,19 +208,25 @@ def clear_inchi_cache():
 # 3) usually what we want?
 
 
-def convert(chem_id, from_type=None, to_type='inchi', verbose=False,
-    allow_nan=False, ignore_cache=False):
+def convertable(chem_id_type):
+    if chem_id_type in chem_id_types or chem_id_type in equivalent_col_names:
+        return True
+    return False
 
-    equivalent_col_names = {
-        'odor': 'name',
-        'cas_number': 'cas'
-    }
+
+def convert(chem_id, from_type=None, to_type='inchi', verbose=False,
+    allow_nan=False, allow_conflicts=True, ignore_cache=False, exclude_cols=[],
+    already_normalized=False, drop_na=True, report_missing=True):
+
     def conversion_fail_errmsg():
         return 'Conversion from {} to {} failed for'.format(from_type, to_type)
 
     def conversion_fail_err():
         msg = conversion_fail_errmsg() + ' {}'.format(chem_id)
-        raise ValueError(msg)
+        if not allow_nan:
+            raise ValueError(msg)
+        elif report_missing:
+            print(msg)
 
     # TODO test w/ index/series/df (w/ index / columns of matching name)
     if hasattr(chem_id, 'shape') and len(chem_id.shape) > 0:
@@ -221,21 +242,19 @@ def convert(chem_id, from_type=None, to_type='inchi', verbose=False,
                 if chem_id.name is None:
                     raise ValueError('either pass from_type or name axes')
 
+                # TODO can series index also have a name? if i'm trying to
+                # support the index renaming case, would also have to check that
+                # here (might want to enforce only either the index or series
+                # itself has a name indicating it can be converted)
                 from_type = chem_id.name
                 if from_type in equivalent_col_names:
                     from_type = equivalent_col_names[from_type]
 
-            # Mostly for recursion from DataFrame case.
-            if from_type not in chem_id_types:
-                if verbose:
-                    print('from_type {} not recognized. not converting.'.format(
-                        from_type))
-                return chem_id
-
             # Forcing allow_nan to True so we can report each of the failing
             # lookups.
             fn = lambda x: convert(x, from_type=from_type, to_type=to_type,
-                verbose=verbose, ignore_cache=ignore_cache, allow_nan=True)
+                verbose=verbose, ignore_cache=ignore_cache, allow_nan=True,
+                already_normalized=already_normalized, report_missing=False)
 
             # TODO test each of these cases
             # TODO also test w/ passing / failing allow_nan case for each
@@ -244,24 +263,35 @@ def convert(chem_id, from_type=None, to_type='inchi', verbose=False,
             # series w/ values to convert in index, or w/ them as the value of
             # the series???? either?
             if hasattr(chem_id, 'index'):
+                '''
                 raise NotImplementedError
                 converted = chem_id.rename(fn).rename(to_name)
                 to_check = chem_id.index
+                '''
+                # TODO maybe get rid of this whole if/else, if i don't also plan
+                # to support the converting-index-of-series case
+                converted = chem_id.map(fn)
+                converted.name = to_type
+                to_check = converted
             else:
                 converted = chem_id.map(fn)
                 converted.name = to_type
                 to_check = converted
 
             missing = to_check.isnull()
-            if not allow_nan and missing.any():
+            if missing.any():
                 err_str = conversion_fail_errmsg() + ':\n'
-                err_str = 'Conversion from {} to {} failed for:\n'.format(
-                    from_type, to_type)
-
-                for m in chem_id[missing]:
+                # TODO check this unique / dropna is what i want
+                for m in chem_id[missing].dropna().unique():
                     err_str += str(m) + '\n'
 
-                raise ValueError(err_str)
+                if not allow_nan:
+                    raise ValueError(err_str)
+                elif report_missing:
+                    print(err_str)
+
+            if drop_na:
+                converted = converted.dropna()
 
             return converted
 
@@ -274,11 +304,114 @@ def convert(chem_id, from_type=None, to_type='inchi', verbose=False,
                     'supported for DataFrames')
 
             df = chem_id.copy()
-            # TODO maybe pass all kwargs at once some way
-            df.index = convert(df.index, to_type=to_type, verbose=verbose,
-                allow_nan=allow_nan, ignore_cache=ignore_cache)
-            df.columns = convert(df.columns, to_type=to_type, verbose=verbose,
-                allow_nan=allow_nan, ignore_cache=ignore_cache)
+
+            # allow_conflicts and exclude_cols are only relevant for DataFrame
+            # case, and therefore do not need to be passed.
+            # from_type should always be inferred in DataFrame case as well.
+            kwargs = {
+                'to_type': to_type,
+                'allow_nan': allow_nan,
+                'ignore_cache': ignore_cache,
+                'drop_na': drop_na,
+                'already_normalized': already_normalized,
+                'report_missing': report_missing,
+                'verbose': verbose
+            }
+            converted_an_index = False
+            if convertable(df.index.name):
+                converted_an_index = True
+                df.index = convert(df.index, **kwargs)
+
+            if convertable(df.columns.name):
+                converted_an_index = True
+                df.columns = convert(df.columns, **kwargs)
+
+            if not converted_an_index:
+                kwargs['allow_nan'] = True
+                kwargs['drop_na'] = False
+                kwargs['already_normalized'] = True
+                kwargs['report_missing'] = False
+
+                attempts = dict()
+                for c in df.columns:
+                    if c not in exclude_cols and convertable(c):
+                        # TODO TODO factor this into a fn / have convert
+                        # recursively handle this w/ code in same place somehow
+                        if c in equivalent_col_names:
+                            ft = equivalent_col_names[c]
+                        else:
+                            ft = c
+
+                        # TODO TODO test other normalize case + other fn name
+                        # lookup cases in c in equivalent_col_names case, since
+                        # that caused the failure here
+                        norm_fn_name = 'normalize_' + ft
+                        if norm_fn_name in globals():
+                            if verbose:
+                                print('Applying {} to input column'.format(
+                                    norm_fn_name))
+
+                            # TODO still print same kind of verbose stuff as
+                            # other normalization section does (refactor?)
+                            norm_fn = globals()[norm_fn_name]
+                            df[c] = df[c].apply(norm_fn)
+                        #
+                        attempts[c] = convert(df[c], **kwargs)
+
+                attempts = pd.DataFrame(attempts)
+
+                missing = attempts.isnull().all(axis=1)
+                if missing.any():
+                    cols = attempts.columns
+                    err_str = \
+                        'Conversion from {} to {} failed for:\n'.format(
+                            [c for c in cols], to_type)
+
+                    with pd.option_context('display.max_colwidth', -1):
+                        err_str += df[missing].drop_duplicates(
+                            subset=cols).dropna(subset=cols, how='all'
+                            ).to_string()
+
+                    if not allow_nan:
+                        raise ValueError(err_str)
+                    elif report_missing:
+                        print(err_str)
+
+                input_priorities = {k: p for p, k in enumerate(chem_id_types)}
+                def priority(id_type):
+                    if id_type in equivalent_col_names:
+                        id_type = equivalent_col_names[id_type]
+                    return input_priorities[id_type]
+
+                cols_in_order = sorted(attempts.columns, key=priority)
+                values = attempts[cols_in_order].apply(
+                    lambda x: x.dropna().unique(), axis=1)
+                # TODO use that str len fn?
+                conflicts = values.apply(lambda x: len(x) > 1)
+
+                # TODO TODO test that this is actually respecting priority
+                df[to_type] = values.apply(
+                    lambda x: None if len(x) == 0 else x[0])
+                if drop_na:
+                    df.dropna(subset=[to_type], inplace=True)
+
+                if conflicts.any():
+                    # Assuming we always want to know if there are conflicts,
+                    # verbose or not.
+                    # TODO make sure only unique conflicts are printed
+                    print('Conflicting lookup results:')
+                    for i, conflict in attempts[conflicts].iterrows():
+                        conflict = conflict.dropna()
+                        inputs = df.loc[i, conflict.keys()]
+                        cdf = pd.DataFrame({'input': inputs,
+                            to_type: conflict
+                        })
+                        with pd.option_context('display.max_colwidth', -1):
+                            print(cdf.to_string(justify='left'))
+
+                    if not allow_conflicts:
+                        raise ValueError('conflicting lookup results')
+                
             return df
 
         else:
@@ -295,17 +428,29 @@ def convert(chem_id, from_type=None, to_type='inchi', verbose=False,
         print('Trying to convert {} from {} to {}'.format(
             chem_id, from_type, to_type))
 
+    # To short-circuit normalization in the more-common case where null exists
+    # before normalization.
     if pd.isnull(chem_id):
         return chem_id
 
     # TODO unit test each of these cases, including None handling
 
-    norm_fn_name = 'normalize_' + from_type
-    if norm_fn_name in globals():
-        old_chem_id = chem_id
-        chem_id = globals()[norm_fn_name](chem_id)
-        if verbose and old_chem_id != chem_id:
-            print('{}({}) -> {}'.format(norm_fn_name, old_chem_id, chem_id))
+    if not already_normalized:
+        norm_fn_name = 'normalize_' + from_type
+        if norm_fn_name in globals():
+            old_chem_id = chem_id
+            chem_id = globals()[norm_fn_name](chem_id)
+            if verbose and old_chem_id != chem_id:
+                print('{}({}) -> {}'.format(norm_fn_name, old_chem_id, chem_id))
+
+    # Since sometimes (just normalize_cas, for now) normalize fns can return
+    # null.
+    if pd.isnull(chem_id):
+        return chem_id
+
+    # TODO TODO for relationships that are *guaranteed* to be one-to-one,
+    # could also populate the reserve direction in the cache when the other
+    # direction is filled (CID <-> inchi? definitely inchikey <-> inchi, right?)
 
     if not ignore_cache:
         if chem_id in cache[from_type][to_type]:
@@ -322,8 +467,7 @@ def convert(chem_id, from_type=None, to_type='inchi', verbose=False,
         if cid is None:
             if verbose:
                 print('CID in cache was None!')
-            if not allow_nan:
-                conversion_fail_err()
+            conversion_fail_err()
             return None
     else:
         f2cid_fn_name = from_type + '2cid'
@@ -346,8 +490,7 @@ def convert(chem_id, from_type=None, to_type='inchi', verbose=False,
                 if chem_id not in to_type_cache:
                     to_type_cache[chem_id] = None
 
-            if not allow_nan:
-                conversion_fail_err()
+            conversion_fail_err()
 
             return None
 
@@ -379,9 +522,7 @@ def convert(chem_id, from_type=None, to_type='inchi', verbose=False,
             if chem_id not in to_type_dict:
                 to_type_dict[chem_id] = None
 
-        if not allow_nan:
-            conversion_fail_err()
-
+        conversion_fail_err()
         return None
 
     compound2t_fn_name = 'compound2' + to_type
@@ -399,14 +540,15 @@ def convert(chem_id, from_type=None, to_type='inchi', verbose=False,
     if verbose and to_type_val is None:
         print('Conversion of {} from Compound to {} failed!'.format(
             chem_id, to_type))
-
-        if not allow_nan:
-            conversion_fail_err()
+        conversion_fail_err()
 
     return to_type_val
 
 
 def normalize_name(name):
+    # TODO don't lowercase letters appearing by themselves?
+    name = name.replace('(CAS)', '').strip().lower()
+
     parts = name.split()
     normed_name = parts[0]
     for a, b in zip(parts, parts[1:]):
@@ -417,7 +559,11 @@ def normalize_name(name):
 
     corrections = {
         'linalool oxide': 'trans-linalool oxide',
-        '4-ethyl guaiacol': '4-ethylguaiacol'
+        '4-ethyl guaiacol': '4-ethylguaiacol',
+        # TODO check that this one is still triggered by something in
+        # natural_odors (copied from normalize_name there)
+        'dihydrazide ethanediimidic acid':
+            'ethanediimidic acid, dihydrazide'
     }
     if normed_name in corrections:
         return corrections[normed_name]
@@ -426,16 +572,49 @@ def normalize_name(name):
         'a-': 'alpha-',
         'b-': 'beta-',
         'g-': 'gamma-',
-        'E2-': '(E)-2-',
-        'E3-': '(E)-3-',
-        'Z2-': '(Z)-2-',
-        'Z3-': '(Z)-3-',
+        # TODO is search case sensitive? (i.e. is initial lower() OK?)
+        # (seems not to matter here at least)
+        'e2-': '(E)-2-',
+        'e3-': '(E)-3-',
+        'z2-': '(Z)-2-',
+        'z3-': '(Z)-3-',
     }
     for p, c in prefix_corrections.items():
         if normed_name.startswith(p):
             normed_name = c + normed_name[len(p):]
 
+    def ester_acid(n):
+        if ' ester ' in n and ' acid' in n:
+            return True
+        return False
+
+    def rev_ester_acid(n):
+        parts = n.split()
+        return ' '.join([parts[2], parts[3] + ',', parts[0], parts[1]])
+            
+    indicator2correction = (
+        (ester_acid, rev_ester_acid),
+    )
+    for i, c in indicator2correction:
+        if i(normed_name):
+            print('Indicator {} was True for {}'.format(
+                i.__name__, normed_name))
+
+            normed_name = c(normed_name)
+
+            print('Applying correction {} to get {}.'.format(
+                c.__name__, normed_name))
+
     return normed_name
+
+
+def normalize_cas(cas):
+    normed_cas = ''.join(cas.replace('"','').split())
+    # TODO library seems to return 0-00-0 sometimes... but this is incorrect,
+    # right? replace w/ NaN?
+    if normed_cas == '0-00-0':
+        return None
+    return normed_cas
 
 
 # TODO maybe also take fns <type>2results or something? which always gets
@@ -498,6 +677,27 @@ def cas2cid(cas, verbose=False):
     return results[0].cid
 
 
+def inchikey2cid(inchikey, verbose=False):
+    try:
+        results = pcp.get_compounds(inchikey, 'inchikey')
+    except urllib.error.URLError as e:
+        warnings.warn('{}\nReturning None.'.format(e))
+        return None
+    assert len(results) == 1
+    return results[0].cid
+
+
+def inchi2cid(inchi, verbose=False):
+    inchi = 'InChI=' + inchi
+    try:
+        results = pcp.get_compounds(inchi, 'inchi')
+    except urllib.error.URLError as e:
+        warnings.warn('{}\nReturning None.'.format(e))
+        return None
+    assert len(results) == 1
+    return results[0].cid
+
+
 def compound2cid(compound):
     return compound.cid
 
@@ -541,6 +741,27 @@ def compound2cas(compound, verbose=False):
 
 def compound2smiles(compound):
     return compound.canonical_smiles
+
+
+def fmt_id_type(chem_id_type):
+    if chem_id_type in equivalent_col_names:
+        chem_id_type = equivalent_col_names[chem_id_type]
+
+    if chem_id_type not in chem_id_types:
+        raise KeyError('unrecognized chem_id type. options are: {}'.format(
+            chem_id_types))
+
+    fmt_dict = {
+        'cas': 'CAS',
+        'inchi': 'InChI',
+        'inchikey': 'InChIKey',
+        'smiles': 'SMILES',
+        'cid': 'PubChem compound ID'
+    }
+    if chem_id_type in fmt_dict:
+        return fmt_dict[chem_id_type]
+    else:
+        return chem_id_type
 
 
 def name2cas(name, verbose=False):
