@@ -98,6 +98,10 @@ manual_type2null_keys = {
         'odor'
     }
 }
+
+# TODO TODO TODO flag to ignore manual overrides, to the extent that they are
+# causing problems. maybe phase them out altogether?
+
 # TODO TODO try deleting / ignoring this hardcoded stuff and see if it still
 # works. my changes to normalize_name probably fixed a few of these cases.
 # (and if it can be ignored, delete it)
@@ -260,13 +264,93 @@ def inchi_layer_set(inchis):
     return inchis.apply(lambda x: set(inchi_layers(x))).agg(union)
 
 
+def is_one2one(df, col1, col2):
+    # TODO TODO maybe modify this to print violations of 1:1-ness, when there
+    # are any (otherwise write another fn for this)
+
+    # from answer by zipa @ stackoverflow.com/questions/50643386
+    # might be a faster way to do this...
+    first = df.drop_duplicates([col1, col2]).groupby(col1)[col2].count().max()
+    second = df.drop_duplicates([col1, col2]).groupby(col2)[col1].count().max()
+    return first + second == 2
+
+
+def print_full_df(df, index=False):
+    with pd.option_context('display.max_colwidth', -1):
+        print(df.to_string(index=False))
+
+
 # TODO better name?
-# TODO TODO TODO implement. groupby stripped ids -> show name + other cols for
-# groups w/ more than one non-stripped per
-''
-def inchi_diff_in_details(df):
-    df.copy(
-'''
+# TODO maybe just delete the include_no_h option and code for that case
+def inchi_diff_in_details(df, include_no_h=False):
+    cols_to_show = ['name','cas_number','inchi']
+    # TODO also count name/cas/(name,cas) here, as we inchi_counts?
+    ncdf = df.drop_duplicates(subset=['name','cas_number','inchi'])
+    print('InChI with multiple combinations of (name, cas_number):')
+    for gn, gdf in ncdf.groupby('inchi'):
+        if len(gdf) <= 1:
+            continue
+        print_full_df(gdf[cols_to_show])
+        print('')
+    print('')
+
+    inchi_counts = df.inchi.value_counts(sort=False)
+
+    # 208
+    #print(len(df.drop_duplicates(subset=['name','cas_number','inchi'])))
+    #
+    df = df.drop_duplicates(subset='inchi').copy()
+    # 201
+    #print(len(df))
+
+    df['inchi_counts'] = df.inchi.apply(lambda i: inchi_counts.at[i])
+
+    df['basic_inchi'] = df.inchi.apply(basic_inchi)
+    if include_no_h:
+        df['basic_inchi_no_h'] = df.inchi.apply(
+            lambda x: basic_inchi(x, include_h=False))
+
+    cols_to_show += ['inchi_counts','basic_inchi']
+
+    # TODO maybe just print part after common prefix for each of these?
+    # (part after basic inchi / basic inchi w/o h)
+
+    print('Multiple standard InChI that map to InChI w/o chirality info:')
+    for gn, gdf in df.groupby('basic_inchi'):
+        if len(gdf) <= 1:
+            continue
+        print_full_df(gdf[cols_to_show])
+        for c in convert(gdf.inchi, to_type='cid'):
+            print_pubchem_link(c)
+        print('')
+    print('')
+
+    if include_no_h:
+        # TODO these two sections might be redundant. check + delete one if so.
+        print('Multiple std InChI that map to InChI w/o chirality OR hydrogen' +
+            ' info:')
+        cols_to_show = cols_to_show + ['basic_inchi_no_h']
+        for gn, gdf in df.groupby('basic_inchi_no_h'):
+            if len(gdf) <= 1:
+                continue
+            print_full_df(gdf[cols_to_show])
+            for c in convert(gdf.inchi, to_type='cid'):
+                print_pubchem_link(c)
+            print('')
+        print('')
+
+        hdf = df.drop_duplicates(subset=['basic_inchi','basic_inchi_no_h']
+            ).copy()
+        print('Multiple no-chirality InChI that map to InChI w/o hydrogen ' +
+            'info:')
+        for gn, gdf in hdf.groupby('basic_inchi_no_h'):
+            if len(gdf) <= 1:
+                continue
+            print_full_df(gdf[cols_to_show])
+            for c in convert(gdf.inchi, to_type='cid'):
+                print_pubchem_link(c)
+            print('')
+        print('')
 
 
 # TODO why does "tetrahedral stereochemistry of atoms and allenes" layer
@@ -477,6 +561,10 @@ def convert(chem_id, from_type=None, to_type='inchi', verbose=False,
                 # which ID was ultimately used (either highest priority of those
                 # that agreed, or the whole set that agreed), for
                 # troubleshooting other normalization problems
+
+                # TODO TODO may want to find set of CIDs that are common to
+                # other lookups (though maybe require they are in the highest
+                # priority), and then try to resolve from there
 
                 # TODO TODO test that this is actually respecting priority
                 df[to_type] = values.apply(
