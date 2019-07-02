@@ -283,10 +283,13 @@ def print_full_df(df, index=False):
 # TODO better name?
 # TODO maybe just delete the include_no_h option and code for that case
 def inchi_diff_in_details(df, include_no_h=False):
-    cols_to_show = ['name','cas_number','inchi']
-    # TODO also count name/cas/(name,cas) here, as we inchi_counts?
-    ncdf = df.drop_duplicates(subset=['name','cas_number','inchi'])
-    print('InChI with multiple combinations of (name, cas_number):')
+    assert 'inchi' in df.columns
+    other_keys = [x for x in df.columns if x in chem_id_types]
+    other_keys += [x for x in df.columns if x in equivalent_col_names]
+    cols_to_show = other_keys + ['inchi']
+    # TODO also count name/cas/(name,cas) here, as w/ inchi_counts?
+    ncdf = df.drop_duplicates(subset=cols_to_show)
+    print('InChI with multiple combinations of {}:'.format(other_keys))
     for gn, gdf in ncdf.groupby('inchi'):
         if len(gdf) <= 1:
             continue
@@ -310,7 +313,7 @@ def inchi_diff_in_details(df, include_no_h=False):
         df['basic_inchi_no_h'] = df.inchi.apply(
             lambda x: basic_inchi(x, include_h=False))
 
-    cols_to_show += ['inchi_counts','basic_inchi']
+    cols_to_show += ['inchi_counts', 'basic_inchi']
 
     # TODO maybe just print part after common prefix for each of these?
     # (part after basic inchi / basic inchi w/o h)
@@ -370,6 +373,7 @@ def count_inchi_layers(inchis):
 # 3) usually what we want?
 
 
+# TODO rename to can_convert? is_chemid_type?
 def convertable(chem_id_type):
     if chem_id_type in chem_id_types or chem_id_type in equivalent_col_names:
         return True
@@ -400,6 +404,10 @@ def convert(chem_id, from_type=None, to_type='inchi', verbose=False,
             to_type = equivalent_col_names[to_type]
         else:
             to_name = to_type
+
+        # TODO TODO TODO whenever this thing maps >1 of old id to 1 of new type,
+        # report! (series/index case may be sufficient)
+        # flag for it indep of verbose. maybe flag to err?
 
         # This covers both Index and Series.
         if len(chem_id.shape) == 1:
@@ -723,6 +731,11 @@ def convert(chem_id, from_type=None, to_type='inchi', verbose=False,
 
 
 def normalize_name(name):
+    # TODO maybe remove first null check in convert if this is the expected
+    # behavior of the norm fns? 
+    if pd.isnull(name):
+        return name
+
     # TODO don't lowercase letters appearing by themselves?
     name = name.replace('(CAS)', '').strip().lower()
 
@@ -740,7 +753,10 @@ def normalize_name(name):
         # TODO check that this one is still triggered by something in
         # natural_odors (copied from normalize_name there)
         'dihydrazide ethanediimidic acid':
-            'ethanediimidic acid, dihydrazide'
+            'ethanediimidic acid, dihydrazide',
+        # Since search of 'E3-hexenol' fails and '(E)-3-hexenol' returns
+        # compound for the (Z)-3 version.
+        'e3-hexenol': '(E)-hex-3-en-1-ol'
     }
     if normed_name in corrections:
         return corrections[normed_name]
@@ -786,6 +802,11 @@ def normalize_name(name):
 
 
 def normalize_cas(cas):
+    # TODO maybe remove first null check in convert if this is the expected
+    # behavior of the norm fns? 
+    if pd.isnull(cas):
+        return cas
+
     normed_cas = ''.join(cas.replace('"','').split())
     # TODO library seems to return 0-00-0 sometimes... but this is incorrect,
     # right? replace w/ NaN?
