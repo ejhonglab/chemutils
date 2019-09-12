@@ -324,7 +324,7 @@ def inchi_diff_in_details(df, include_no_h=False):
             continue
         print_full_df(gdf[cols_to_show])
         for c in convert(gdf.inchi, to_type='cid'):
-            print_pubchem_link(c)
+            print(pubchem_link(c))
         print('')
     print('')
 
@@ -338,7 +338,7 @@ def inchi_diff_in_details(df, include_no_h=False):
                 continue
             print_full_df(gdf[cols_to_show])
             for c in convert(gdf.inchi, to_type='cid'):
-                print_pubchem_link(c)
+                print(pubchem_link(c))
             print('')
         print('')
 
@@ -351,7 +351,7 @@ def inchi_diff_in_details(df, include_no_h=False):
                 continue
             print_full_df(gdf[cols_to_show])
             for c in convert(gdf.inchi, to_type='cid'):
-                print_pubchem_link(c)
+                print(pubchem_link(c))
             print('')
         print('')
 
@@ -739,12 +739,18 @@ def normalize_name(name):
     # TODO don't lowercase letters appearing by themselves?
     name = name.replace('(CAS)', '').strip().lower()
 
+    # TODO test this doesn't break any of my natural_odors usage
+    # TODO maybe similar length condition on stuff before open paren?
+    # .{3,} means "at least 3 of any character"
+    name = re.sub(r'\(.{3,}\)', '', name)
+
     parts = name.split()
     normed_name = parts[0]
     for a, b in zip(parts, parts[1:]):
         # We don't want to join adjacent words.
         if a[-1].isalpha() and b[0].isalpha():
             b = ' ' + b
+
         normed_name += b
 
     corrections = {
@@ -815,8 +821,8 @@ def normalize_cas(cas):
     return normed_cas
 
 
-def print_pubchem_link(cid):
-    print('https://pubchem.ncbi.nlm.nih.gov/compound/{}'.format(cid))
+def pubchem_link(cid):
+    return 'https://pubchem.ncbi.nlm.nih.gov/compound/{}'.format(cid)
 
 
 # TODO maybe also take fns <type>2results or something? which always gets
@@ -860,7 +866,7 @@ def name2cid(name, verbose=False):
         print(counts)
         for r in results:
             print(r.inchi)
-            print_pubchem_link(r.cid)
+            print(pubchem_link(r.cid))
         print('')
     #
 
@@ -908,7 +914,7 @@ def cas2cid(cas, verbose=False):
         print(counts)
         for r in results:
             print(r.inchi)
-            print_pubchem_link(r.cid)
+            print(pubchem_link(r.cid))
         print('')
     #
     return results[0].cid
@@ -1226,6 +1232,22 @@ def inchikey2inchi(inchikey):
     inchi = result[6:]
 
     return inchi
+
+
+# TODO support hardcoded odor->canonical names
+# TODO pick chem_id automtically in order from df columns avail +
+# err if necessary
+# TODO maybe move back to natural_odors/odors.py now that i'm not actually using
+# this elsewhere?
+def normalize_chem_ids(df, chem_id, allow_nan=False, verbose=False):
+    """Normalize on chem_id then back convert names.
+    """
+    df = chemutils.convert(df, to_type=chem_id, allow_nan=allow_nan,
+        verbose=verbose)
+
+    df['name'] = chemutils.convert(df[chem_id], to_type='name',
+        verbose=verbose)
+    return df
 
 
 if __name__ == '__main__':
