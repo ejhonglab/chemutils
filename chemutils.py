@@ -6,6 +6,7 @@ import atexit
 import urllib.error
 import warnings
 from collections import Counter
+import traceback
 
 import pubchempy as pcp
 import pandas as pd
@@ -385,7 +386,8 @@ def convertable(chem_id_type):
 # not waste time. (not as much of a priority if clear_cache approach works)
 def convert(chem_id, from_type=None, to_type='inchi', verbose=False,
     allow_nan=False, allow_conflicts=True, ignore_cache=False, exclude_cols=[],
-    already_normalized=False, drop_na=True, report_missing=True):
+    already_normalized=False, drop_na=True, report_missing=True,
+    report_conflicts=True):
 
     def conversion_fail_errmsg():
         return 'Conversion from {} to {} failed for'.format(from_type, to_type)
@@ -581,18 +583,17 @@ def convert(chem_id, from_type=None, to_type='inchi', verbose=False,
                     df.dropna(subset=[to_type], inplace=True)
 
                 if conflicts.any():
-                    # Assuming we always want to know if there are conflicts,
-                    # verbose or not.
-                    # TODO make sure only unique conflicts are printed
-                    print('Conflicting lookup results:')
-                    for i, conflict in attempts[conflicts].iterrows():
-                        conflict = conflict.dropna()
-                        inputs = df.loc[i, conflict.keys()]
-                        cdf = pd.DataFrame({'input': inputs,
-                            to_type: conflict
-                        })
-                        with pd.option_context('display.max_colwidth', -1):
-                            print(cdf.to_string(justify='left'))
+                    if not allow_conflicts or report_conflicts:
+                        # TODO make sure only unique conflicts are printed
+                        print('Conflicting lookup results:')
+                        for i, conflict in attempts[conflicts].iterrows():
+                            conflict = conflict.dropna()
+                            inputs = df.loc[i, conflict.keys()]
+                            cdf = pd.DataFrame({'input': inputs,
+                                to_type: conflict
+                            })
+                            with pd.option_context('display.max_colwidth', -1):
+                                print(cdf.to_string(justify='left'))
 
                     if not allow_conflicts:
                         raise ValueError('conflicting lookup results')
@@ -834,6 +835,7 @@ def name2cid(name, verbose=False):
         #results = pcp.get_synonyms(name, 'name')
         results = pcp.get_compounds(name, 'name')
     except urllib.error.URLError as e:
+        traceback.print_exc()
         warnings.warn('{}\nReturning None.'.format(e))
         return None
 
