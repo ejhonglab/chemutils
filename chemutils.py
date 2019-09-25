@@ -545,7 +545,7 @@ def convert(chem_id, from_type=None, to_type='inchi', verbose=False,
                     with pd.option_context('display.max_colwidth', -1):
                         err_str += df[missing].drop_duplicates(
                             subset=cols).dropna(subset=cols, how='all'
-                            ).to_string()
+                            )[cols].to_string()
 
                     if not allow_nan:
                         raise ValueError(err_str)
@@ -740,10 +740,14 @@ def normalize_name(name):
     # TODO don't lowercase letters appearing by themselves?
     name = name.replace('(CAS)', '').strip().lower()
 
+    # TODO add test cases for things this re.sub and following for loop
+    # were trying to address
+
     # TODO test this doesn't break any of my natural_odors usage
     # TODO maybe similar length condition on stuff before open paren?
     # .{3,} means "at least 3 of any character"
-    name = re.sub(r'\(.{3,}\)', '', name)
+    # Square bracket part means "any character but parentheses"
+    name = re.sub(r'\([^\(\)]{3,}\)', '', name)
 
     parts = name.split()
     normed_name = parts[0]
@@ -1244,11 +1248,8 @@ def inchikey2inchi(inchikey):
 def normalize_chem_ids(df, chem_id, allow_nan=False, verbose=False):
     """Normalize on chem_id then back convert names.
     """
-    df = chemutils.convert(df, to_type=chem_id, allow_nan=allow_nan,
-        verbose=verbose)
-
-    df['name'] = chemutils.convert(df[chem_id], to_type='name',
-        verbose=verbose)
+    df = convert(df, to_type=chem_id, allow_nan=allow_nan, verbose=verbose)
+    df['name'] = convert(df[chem_id], to_type='name', verbose=verbose)
     return df
 
 
