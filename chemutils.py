@@ -1331,6 +1331,14 @@ def inchi2abbrev_dict(df, allow_orphan_abbrevs=False):
     return dict(zip(df.inchi[abbrev_notnull], df.abbrev[abbrev_notnull]))
 
 
+def odor_is_mix(odor_name):
+    """Returns True if odor is the mixture in my complex mix expts, else False.
+    For ordering odors in plots.
+    """
+    lo = odor_name.lower()
+    return 'approx' in lo or 'mix' in lo
+
+
 hardcoded_odor2abbrevs = {
     'paraffin': 'pfo',
     'd3 kiwi': 'kiwi'
