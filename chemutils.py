@@ -165,6 +165,20 @@ def clear_cache():
     cache = init_cache()
 
 
+def _clear_null_cache_vals(write=True):
+    global cache
+    for from_type, to_type_to_cache_dict in cache.items():
+        for to_type, f2t_dict in to_type_to_cache_dict.items():
+            # Need list() since .items() is an iterator that expects contents
+            # not to change.
+            for f, t in list(f2t_dict.items()):
+                if pd.isnull(t):
+                    del f2t_dict[f]
+
+    if write:
+        save_cache(merge_with_saved=False)
+
+
 def delete_cache():
     """Deletes and clears the cache at cache_file
     """
@@ -178,6 +192,14 @@ def load_cache():
         try:
             with open(cache_file, 'rb') as f:
                 _cache = pickle.load(f)
+
+            # TODO delete (was planning to use to load inverted maps here)
+            '''
+            for from_type, to_type_dict in _cache.items():
+                for to_type, f2t_cache in to_type_dict.items():
+            '''
+            #
+
             return _cache
         except ValueError:
             print('Cache was in unreadable format. Deleting.')
@@ -194,20 +216,32 @@ def save_oldcache():
             to_smiles_cache), f)
 
 
-def save_cache():
+def save_cache(merge_with_saved=True):
     """
     Load old cache first, so that clear_cache doesn't have to worry about
     screwing up on-disk cache when atexit call to save_cache triggers.
     """
-    # TODO need "global cache", as long as cache def is below fn def, or what?
-    # if that's all, move "cache = load_cache()" just above this, and declare
-    # as global in load_cache, cause circularity
-    old_cache = load_cache()
-    # So any current values overwrite old_cache values.
-    old_cache.update(cache)
-    
+    if merge_with_saved:
+        # TODO need "global cache", as long as cache def is below fn def, or
+        # what?  if that's all, move "cache = load_cache()" just above this, and
+        # declare as global in load_cache, cause circularity
+        old_cache = load_cache()
+
+        # So any current values overwrite old_cache values.
+        assert old_cache.keys() == cache.keys()
+        for from_type, to_type_dicts in cache.items():
+            old_cache_to_type_dicts = old_cache[from_type]
+            assert old_cache_to_type_dicts.keys() == to_type_dicts.keys()
+            for to_type, f2t_dict in to_type_dicts.items():
+                old_cache_f2t_dict = old_cache_to_type_dicts[to_type]
+                old_cache_f2t_dict.update(f2t_dict)
+
+        to_save = old_cache
+    else:
+        to_save = cache
+
     with open(cache_file, 'wb') as f:
-        pickle.dump(old_cache, f)
+        pickle.dump(to_save, f)
 
 
 # TODO test
@@ -382,13 +416,16 @@ def convertable(chem_id_type):
     return False
 
 
+# TODO TODO tqdm in all but single element case (way to make it work in case
+# where something is iterated over w/ call to convert at each iteration?)
+
 # TODO in ignore_cache case, still make a interpreter run / call specific
 # cache, or like de-dupe and re-dupe, so as to still test new behavior, but also
 # not waste time. (not as much of a priority if clear_cache approach works)
 def convert(chem_id, from_type=None, to_type='inchi', verbose=False,
     allow_nan=False, allow_conflicts=True, ignore_cache=False, exclude_cols=[],
     already_normalized=False, drop_na=True, report_missing=True,
-    report_conflicts=True):
+    report_conflicts=True, try_non_normalized=True):
 
     def conversion_fail_errmsg():
         return 'Conversion from {} to {} failed for'.format(from_type, to_type)
@@ -622,10 +659,10 @@ def convert(chem_id, from_type=None, to_type='inchi', verbose=False,
 
     # TODO unit test each of these cases, including None handling
 
+    old_chem_id = chem_id
     if not already_normalized:
         norm_fn_name = 'normalize_' + from_type
         if norm_fn_name in globals():
-            old_chem_id = chem_id
             chem_id = globals()[norm_fn_name](chem_id)
             if verbose and old_chem_id != chem_id:
                 print('{}({}) -> {}'.format(norm_fn_name, old_chem_id, chem_id))
@@ -636,13 +673,23 @@ def convert(chem_id, from_type=None, to_type='inchi', verbose=False,
         return chem_id
 
     # TODO TODO for relationships that are *guaranteed* to be one-to-one,
-    # could also populate the reserve direction in the cache when the other
+    # could also populate the reverse direction in the cache when the other
     # direction is filled (CID <-> inchi? definitely inchikey <-> inchi, right?)
+    # ...and do they have to be 1:1?
 
     if not ignore_cache:
+        # TODO should this fail into elif if cached value is None?
+        # (be consistent w/ all branches on try_non_normalized)
         if chem_id in cache[from_type][to_type]:
             val = cache[from_type][to_type][chem_id]
             if verbose:
+                print('Returning {} from cache'.format(val))
+            return val
+
+        elif try_non_normalized and old_chem_id in cache[from_type][to_type]:
+            val = cache[from_type][to_type][old_chem_id]
+            if verbose:
+                print('Falling back to non-normalized chem_id')
                 print('Returning {} from cache'.format(val))
             return val
 
@@ -656,6 +703,21 @@ def convert(chem_id, from_type=None, to_type='inchi', verbose=False,
                 print('CID in cache was None!')
             conversion_fail_err()
             return None
+
+    elif (not ignore_cache and try_non_normalized and
+        old_chem_id in cache[from_type]['cid']):
+
+        cid = cache[from_type]['cid'][old_chem_id]
+        if verbose:
+            print('Falling back to non-normalized chem_id')
+            print('{} of type {} had CID {} in cache'.format(old_chem_id,
+                from_type, cid))
+        if cid is None:
+            if verbose:
+                print('CID in cache was None!')
+            conversion_fail_err()
+            return None
+
     else:
         f2cid_fn_name = from_type + '2cid'
         if f2cid_fn_name not in globals():
@@ -666,10 +728,21 @@ def convert(chem_id, from_type=None, to_type='inchi', verbose=False,
             print('Calling CID lookup function', f2cid_fn_name)
 
         cid = globals()[f2cid_fn_name](chem_id)
+
         if cid is None:
             if verbose:
                 print('Looking up CID for {} of type {} failed!'.format(
                     chem_id, from_type))
+
+            if try_non_normalized:
+                if verbose:
+                    print('Falling back to non-normalized chem_id')
+                cid = globals()[f2cid_fn_name](old_chem_id)
+
+        if cid is None:
+            if try_non_normalized and verbose:
+                print('Looking up CID for {} of type {} failed!'.format(
+                    old_chem_id, from_type))
 
             for tt in chem_id_types:
                 to_type_cache = cache[from_type][tt]
@@ -678,7 +751,6 @@ def convert(chem_id, from_type=None, to_type='inchi', verbose=False,
                     to_type_cache[chem_id] = None
 
             conversion_fail_err()
-
             return None
 
         if verbose:
@@ -695,6 +767,7 @@ def convert(chem_id, from_type=None, to_type='inchi', verbose=False,
     # service", which we might already have in the results...) idk...
     compound = pcp.Compound.from_cid(cid)
     if compound is None:
+        # TODO should i just assert false here or something?
         if verbose:
             print('Creating Compound from CID {} failed!'.format(cid))
 
