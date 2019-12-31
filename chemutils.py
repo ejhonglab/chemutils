@@ -659,6 +659,8 @@ def convert(chem_id, from_type=None, to_type='inchi', verbose=False,
 
     # TODO unit test each of these cases, including None handling
 
+    # TODO caching that can also short circuit this step? use same cache?
+    # (seems to be taking up most of time in odor2abbrev case)
     old_chem_id = chem_id
     if not already_normalized:
         norm_fn_name = 'normalize_' + from_type
@@ -1414,10 +1416,12 @@ def odor_is_mix(odor_name):
 
 hardcoded_odor2abbrevs = {
     'paraffin': 'pfo',
-    'd3 kiwi': 'kiwi'
+    'd3 kiwi': 'kiwi',
+    'fly food b': 'fly food'
 }
 hardcoded_not_to_abbrev = {
     'pfo',
+    'water'
 }
 _inchi2abbrev = None
 def odor2abbrev(odor_name, *args, allow_orphan_abbrevs=False,
