@@ -14,6 +14,7 @@ from collections import Counter
 import traceback
 import functools
 import inspect
+import time
 
 import numpy as np
 import pubchempy as pcp
@@ -25,6 +26,8 @@ import pint
 # Should be included with pint. Some pint fn can throw this.
 from tokenize import TokenError
 
+
+pkg_data_dir = split(__file__)[0]
 
 # See notes in pint docs about concerns when pickling pint quantities or 
 # trying to use multiple unit registries...
@@ -43,6 +46,18 @@ pint.set_application_registry(ureg)
 
 cache_file = os.path.expanduser('~/.chemutils_cache.p')
 
+chemspipy_api_key = None
+chemspipy_api_key_file = os.path.expanduser('~/.chemspipy_api_key')
+if exists(chemspipy_api_key_file):
+    with open(chemspipy_api_key_file, 'r') as f:
+        chemspipy_api_key = f.read().strip()
+
+def set_chemspipy_api_key(cs_api_key):
+    global chemspipy_api_key
+    assert type(cs_api_key) is str
+    chemspipy_api_key = cs_api_key
+
+
 # In descending order of the certainty each ID provides as to whether we found
 # the right PubChem entry.
 chem_id_types = [
@@ -57,9 +72,11 @@ equivalent_col_names = {
     'odor': 'name',
     'cas_number': 'cas'
 }
-# No matter the type these are to be converted to, they will always return a
-# null value. (maybe handle some other way?)
-manual_type2null_keys = {
+# No matter which `chem_id_type` these are to be converted to, they will always
+# return a null value. (maybe handle some other way?)
+# NOTE: keys in `properties` are currently except from this. maybe they should
+# not be?
+hardcoded_type2null_keys = {
     'name': {
         'spontaneous firing rate',
         'odor'
@@ -79,8 +96,224 @@ properties  = [
     'molar_mass'
 ]
 
-# TODO TODO TODO flag to ignore manual overrides, to the extent that they are
-# causing problems. maybe phase them out altogether?
+concentration_dimensionalities = [
+    '[length]^-3 [mass]',
+    # This seems to be how pint formats molarity (M).
+    '[length]^-3 [substance]'
+]
+preferred_concentration_unit = 'g / L'
+preferred_density_unit = 'g / mL'
+dimensionality2preferred_units = {
+    # TODO i guess this has the same dimensionality as 'density'??
+    # maybe don't just lookup via dimensionality then, if i want 
+    # different answers for density and concentration (g/L) inputs?
+    # TODO or some way to have two different substances in pint unit repr?
+    # (they'd be same in density case vs diff in conc case)
+    '[length]^-3 [mass]': preferred_concentration_unit,
+    '[length]^-3 [substance]': 'molar',
+    '[length]^-1 [mass] [time]^-2': 'kPa'
+}
+# Checking that pint parses all preferred units to the expected
+# dimensionality.
+for dim, preferred_unit_str in dimensionality2preferred_units.items():
+    assert ureg[preferred_unit_str].check(dim)
+
+# TODO maybe this should completely replace the above?
+property2preferred_units = {
+    'concentration': preferred_concentration_unit,
+    'density': preferred_density_unit,
+    # Just what NIST uses. May want to change.
+    'k_henry': 'mol / kg / bar',
+    'vapor_pressure': 'kPa',
+    'water_solubility': 'g / L',
+    # TODO want this here?
+    'molar_mass': 'g / mol'
+}
+
+
+def is_concentration_unit(units):
+    """
+    Returns whether a `pint` `Unit`/`Quantity` has dimensionality we accept as a
+    concentration.
+    """
+    # This is to detect the pint Unit class, as opposed to Quantity.
+    if not hasattr(units, 'u'):
+        # Since units don't have the same check methods as quantities.
+        quantity = ureg.Quantity(1, units)
+    else:
+        quantity = units
+
+    return any([quantity.check(d) for d in concentration_dimensionalities])
+
+
+def in_expected_units(expected_units, test_units):
+    """Returns whether `expected_units` and `test_units` are equivalent.
+
+    `expected_units` must be one of `None` or a `str` that is either
+        'concentration', 'density', or something `pint` can parse.
+
+    `test_units` is a `pint` `Quantity` or `Unit` object.
+
+    Equivalent in the sense that they share the same number of factors of each
+    base unit type.
+    """
+    # Lone numbers, for instance, parse to dimensionless units.
+    if expected_units is None:
+        return not test_units.dimensionless
+
+    elif expected_units == 'concentration':
+        return is_concentration_unit(test_units)
+
+    elif expected_units == 'density':
+        return (test_units.dimensionality ==
+            ureg[preferred_density_unit].dimensionality
+        )
+
+    else:
+        return test_units.dimensionality == ureg[expected_units].dimensionality
+
+
+def change_series_units(series, new_unit_str, new_units=None):
+    """Converts units of Series with at least the keys ['value','units']
+    """
+    if new_units is None:
+        # implement only if useful to refactor other stuff to use this
+        # (calculate from new_unit_str)
+        raise NotImplementedError
+
+    unit_str = series['units']
+    if not new_units.check(unit_str):
+        raise ValueError(f'units {unit_str} inconsistent with {new_unit_str}')
+
+    # TODO maybe also use new_units here to avoid having to parse a second
+    # time??
+    m = (series['value'] * ureg[unit_str]).to(new_unit_str).magnitude
+
+    new_series = series.copy()
+    new_series['value'] = m
+    new_series['units'] = new_unit_str
+    return new_series
+
+
+# TODO maybe the pint pandas module can do some / all of this?
+# TODO refactor add_properties / add_properties_to_cache to use this or
+# something like this?
+def change_frame_units(df, prop=None, prop_col='property', value_col='value',
+    units_col='units'):
+    """Returns single-property DataFrame with property in preferred units.
+
+    Assuming that input is not null in any of the columns this fn uses, all
+    unit strings are parseasble, and all property values are numeric.
+    """
+    # TODO delete
+    '''
+    print(type(df))
+    print(df)
+    return df
+    '''
+    #
+    if prop is None:
+        assert prop_col in df.columns, 'define prop or prop_col'
+        unique_props = df[prop_col].unique()
+        assert len(unique_props) == 1
+        prop = unique_props[0]
+
+    assert prop in property2preferred_units, \
+        'not supporting manual units being passed in for now'
+
+    preferred_unit_str = property2preferred_units[prop]
+    preferred_units = ureg[preferred_unit_str]
+
+    series_fn = lambda s: change_series_units(s, preferred_unit_str,
+        preferred_units
+    )
+    return df.apply(series_fn, axis=1)
+
+
+# TODO maybe move the whole hardcode thing to some external data file like this
+# TODO facilities for deployment specific additions to the hardcoded stuff
+# (out of package dir)
+hardcoded_properties_xlsx = join(pkg_data_dir, 'hardcoded_properties.xlsx')
+def load_manual_properties(to_update):
+    """Updates passed in `dict` with chemical properties in spreadsheet."""
+    if not exists(hardcoded_properties_xlsx):
+        return
+
+    df = pd.read_excel(hardcoded_properties_xlsx)
+    df.dropna(how='all', inplace=True)
+
+    expected_cols = [
+        'property',
+        'inchi',
+        'value',
+        'units',
+        'sources'
+    ]
+    assert all([e in df.columns for e in expected_cols])
+
+    # So you don't have to keep re-entering these for consecutive rows that
+    # would have the same value.
+    df['property'] = df['property'].ffill()
+    df['inchi'] = df['inchi'].ffill()
+
+    cols_have_null = df[expected_cols].isnull().any()
+    if cols_have_null.any():
+        nc_names = list(np.array(expected_cols)[cols_have_null])
+        warnings.warn(f'{hardcoded_properties_xlsx} has null values in columns:'
+            f' {nc_names}\n\nRows with null values in ANY of these columns '
+            'will not be used!'
+        )
+        df.dropna(subset=expected_cols, inplace=True)
+
+    # TODO add a 'weight' column that can be filled in for values with multiple
+    # sources
+    assert not df.duplicated(subset=['property','inchi','sources']).any()
+
+    # TODO maybe check inchi against name (but otherwise don't use name)
+    # (to catch some data entry errors, where inchi and name are misaligned)
+    name_cols = [c for c in df.columns if c.startswith('name')]
+    if len(name_cols) > 0:
+        assert len(name_cols) == 1
+        name_col = name_cols[0]
+        # Since we are ffilling 'inchi', to avoid null values causing false
+        # positive duplicates.
+        df[name_col] = df[name_col].ffill()
+        assert not df.duplicated(subset=['property', name_col, 'sources']).any()
+
+    df = df.groupby('property').apply(change_frame_units)
+    assert (df.groupby('property').units.nunique() == 1).all()
+
+    # So far, this is the only "to_type" I've used for any property lookups.
+    from_type = 'inchi'
+    if from_type not in to_update:
+        to_update[from_type] = dict()
+    to_update_f = to_update[from_type]
+
+    # This averages across sources, if there are multiple.
+    df = df.groupby(['property','inchi'], sort=False).agg({
+        'value': 'mean', 'units': 'first', 'sources': '\n'.join
+    })
+    for row in df.itertuples():
+        to_type, inchi = row.Index
+        assert to_type in properties
+
+        if to_type not in to_update_f:
+            to_update_f[to_type] = dict()
+
+        # TODO again, factor out this prop series creation stuff?
+        to_update_f[to_type][inchi] = pd.Series({
+            # TODO maybe refactor everything so it doesn't duplicate the
+            # property name in each key??? not sure why i ever thought that'd be
+            # a good idea... was it just for the few cases where i use a wide
+            # spreadsheet, using the prefixes to keep the column names unique?
+            to_type: row.value,
+            f'{to_type}_units': row.units,
+            f'{to_type}_sources': row.sources
+        })
+
+
+# TODO TODO TODO flag to ignore hardcoded / manual overrides, to the extent that
+# they are causing problems. maybe phase them out altogether?
 
 # TODO TODO try deleting / ignoring this hardcoded stuff and see if it still
 # works. my changes to normalize_name probably fixed a few of these cases.
@@ -89,7 +322,7 @@ properties  = [
 # (have that just apply to values that originally came from a lookup)
 # (maybe have another flag / another level of ignore_cache that also applies to
 # these values)
-manual = {
+hardcoded = {
     'name': {
         'cas': {
             # TODO deal w/ linalool (or maybe at cid level?)
@@ -119,6 +352,7 @@ manual = {
         }
     }
 }
+load_manual_properties(hardcoded)
 
 
 # TODO TODO conversion to names with a priority on various sources:
@@ -128,33 +362,123 @@ manual = {
 # 3) other (good default available in pubchempy? probably not iupac...)
 
 
-def add_manual_overrides(_cache):
-    for ft, null_keys in manual_type2null_keys.items():
+# TODO TODO use this in all the other places that do something similar
+# TODO TODO unit test this! 
+def is_series(obj):
+    # TODO are my fears that the full path the the series object might change /
+    # have changed at some point justified, or should i just check the fully
+    # qualified path (or comparison of type to that of initialized empty one?)
+    # (if not, maybe just use isinstance(obj, pd.Series)? or issubclass?)
+
+    # Adapted from: https://stackoverflow.com/questions/2020014
+    _type = type(obj)
+    # The intermediate part (of __module__) that is not matched is:
+    # 'core.series' for me, w/ pandas 0.25.1
+    if _type.__name__ == 'Series' and _type.__module__.startswith('pandas.'):
+        return True
+
+    # TODO subclasses? (not that it really matters for any of my use cases
+    # now... it just might if i wanted to solve the is_series matter once and
+    # for all...)
+
+    return False
+
+
+# TODO TODO use this in all the other places that do something similar
+# TODO TODO unit test this! 
+def isnull(x):
+    """
+    Returns True if either:
+    1) `pd.isnull(val)` would return True without raising an error.
+    2) `val` is a Series, and all values are null.
+    ...otherwise returns False.
+    """
+    # We specifically only want this behavior for pandas Series,
+    # not DataFrame or numpy ndarray objects.
+    if is_series(x):
+        return x.isnull().all()
+    else:
+        # Forcing to bool first so ValueError is triggered here, rather than
+        # actually causing an error in the calling code. DataFrames or numpy
+        # arrays will raise this ValueError, with the message:
+        # "The truth value of an array with more than one element is ambiguous.
+        # Use a.any() or a.all()"
+        is_null = pd.isnull(x)
+        try:
+            return bool(is_null)
+
+        # TODO test cases w/ other things that raise value their own valueerrors
+        # (or other errors) on casting to bool? check the str message is the
+        # numpy array one? if there are other ValueErrors, and this is the only
+        # error casting to bool should raise, maybe this is the behavior i want
+        # though?
+        except ValueError as e:
+            return False
+
+
+def add_hardcoded_overrides(_cache, overwrite_existing=True):
+    """
+    Args:
+    overwrite_existing (bool): If True, non-null keys will not be overwritten by
+        values in `hardcoded` (though values in `hardcoded_type2null_keys` will
+        still overwrite with `None` unconditionally).
+    """
+    for ft, null_keys in hardcoded_type2null_keys.items():
         for nk in null_keys:
             for tt in chem_id_types:
                 _cache[ft][tt][nk] = None
 
-    for ft, tts in manual.items():
+    # TODO delete
+    first = True
+    #
+    for ft, tts in hardcoded.items():
         for tt in tts:
-            _cache[ft][tt].update(tts[tt])
+            if overwrite_existing:
+                _cache[ft][tt].update(tts[tt])
+
+            # TODO TODO add a test that ensures this is equivalent to the update
+            # call in the case where there are no overlap between existing
+            # values and those to be hardcoded
+            else:
+                f2t_dict = _cache[ft][tt]
+                hardcoded_f2t_dict = tts[tt]
+                for hk, hv in hardcoded_f2t_dict.items():
+                    if hk not in f2t_dict or isnull(f2t_dict[hk]):
+                        # TODO delete
+                        if first:
+                            first = False
+                            if hk not in f2t_dict:
+                                print('Not already in cache')
+                            else:
+                                print('Existing was null')
+                            print("_cache['" + "']['".join([ft, tt, hk]) + "']")
+                            print('Hardcoding:', hk, hv)
+                            import ipdb; ipdb.set_trace()
+                        #
+                        f2t_dict[hk] = hv
+
+    if not overwrite_existing and not first:
+        import ipdb; ipdb.set_trace()
 
 
 def init_cache():
-    # TODO if load_cache only adds properties (or whatever i rename that to)
+    # TODO if load_state only adds properties (or whatever i rename that to)
     # behind into, should probably be consistent here
     # (same w/ other things not added behind all from types)
+    # TODO maybe modify this fn so it can init only sub-caches not in current
+    # cache (and then always call init_cache some way like that on loading)?
     _cache = {ft: {tt: dict() for tt in chem_id_types + properties}
         for ft in chem_id_types
     }
-    add_manual_overrides(_cache)
+    add_hardcoded_overrides(_cache)
     return _cache
 
 
 def _clear_one_cache(ft, tt):
     assert ft in cache and tt in cache[ft]
     cache[ft][tt] = dict()
-    with open(cache_file, 'wb') as f:
-        pickle.dump(cache, f)
+    # TODO need to do something w/ is_manual here too?
+    save_cache(merge_with_saved=False)
 
 
 # TODO maybe relax str restriction on values so this works in compound ID case
@@ -180,10 +504,12 @@ def _clear_vals_in_cache(ft, tt, vals):
         except KeyError:
             pass
 
-    with open(cache_file, 'wb') as f:
-        pickle.dump(cache, f)
+    # TODO need to do something w/ is_manual here too?
+    save_cache(merge_with_saved=False)
 
 
+# TODO TODO if any of these clearing fns delete stuff that has is_manual set,
+# also delete that part of is_manual
 def clear_cache(*args):
     global cache
     if len(args) == 0:
@@ -209,9 +535,17 @@ def _clear_null_cache_vals(write=True):
             # Need list() since .items() is an iterator that expects contents
             # not to change.
             for f, t in list(f2t_dict.items()):
-                # TODO TODO if null values are sometimes going to be represented
-                # as pd.Series though, need to check isnull().all() for them!
+                # TODO TODO use this commented bit to replace the below after
+                # verifying isnull works
+                #if isnull(t):
+                #    del f2t_dict[f]
+
                 if not hasattr(t, 'shape') and pd.isnull(t):
+                    del f2t_dict[f]
+
+                # TODO maybe error handling in case it had shape but not .all()
+                # (or more specific way of detecting series)
+                elif hasattr(t, 'shape') and t.isnull().all():
                     del f2t_dict[f]
 
     if write:
@@ -227,11 +561,15 @@ def delete_cache():
         os.remove(cache_file)
 
 
-def load_cache():
+def load_state():
+    """Loads `cache` and `is_manual` from `cache_file`.
+    """
     if exists(cache_file):
         try:
             with open(cache_file, 'rb') as f:
-                _cache = pickle.load(f)
+                data = pickle.load(f)
+                _cache = data['cache']
+                _is_manual = data['is_manual']
 
             # TODO delete (was planning to use to load inverted maps here)
             '''
@@ -240,19 +578,34 @@ def load_cache():
             '''
             #
 
+            add_hardcoded_overrides(_cache, overwrite_existing=False)
+
             # TODO shouldn't this logic (also, w/o refactoring) be in
             # init_cache?
             for k in properties:
                 if k not in _cache['inchi']:
                     _cache['inchi'][k] = dict()
-            return _cache
-        except ValueError:
+
+            return _cache, _is_manual
+
+        # TODO TODO TODO what raises this ValueError????
+        # (pickle load? put it only around the potentially offending section!!!)
+        except ValueError as e:
+            raise
+            # TODO TODO probably just print warning, maybe print a command
+            # that can be manually run to delete cache / prompt about whether
+            # cache should be deleted.
+            # TODO maybe all changes to the cache should be round tripped
+            # through this load, to check this doesn't happen?
+            '''
             print('Cache was in unreadable format. Deleting.')
             delete_cache()
+            # TODO cache guaranteed to be defined here...? not sure it is. test.
             # Will have already been init'd in delete_cache call.
-            return cache
+            return cache, dict()
+            '''
     else:
-        return init_cache()
+        return init_cache(), dict()
 
 
 def save_cache(merge_with_saved=True):
@@ -263,9 +616,11 @@ def save_cache(merge_with_saved=True):
     # TODO why did i ever want merge_with_saved again??
     if merge_with_saved:
         # TODO need "global cache", as long as cache def is below fn def, or
-        # what?  if that's all, move "cache = load_cache()" just above this, and
-        # declare as global in load_cache, cause circularity
-        old_cache = load_cache()
+        # what?  if that's all, move "cache = load_state()" just above this, and
+        # declare as global in load_state, cause circularity (?)
+        # TODO also want to hae merge_with_saved apply to is_manual somewhat
+        # similarly (that's the second returned value currently ignored here)?
+        old_cache, _ = load_state()
 
         # So any current values overwrite old_cache values.
         assert old_cache.keys() == cache.keys()
@@ -288,14 +643,46 @@ def save_cache(merge_with_saved=True):
         to_save = cache
 
     with open(cache_file, 'wb') as f:
-        pickle.dump(to_save, f)
+        data = {'cache': to_save, 'is_manual': is_manual}
+        pickle.dump(data, f)
 
 
-# TODO provide a "private" fn to delete single entries from cache
-# TODO and another to manually enter persistent overrides
+# TODO fn to manually enter persistent overrides?
 
 # TODO test
-cache = load_cache()
+cache, is_manual = load_state()
+
+# TODO maybe factor into load_state / some other check fn called there
+# TODO maybe add to cache fn to check units of these if they are properties?
+for prop, preferred_unit_str in property2preferred_units.items():
+    prop_units = ureg[preferred_unit_str]
+    prop_unit_key = f'{prop}_units'
+    #print('checking cache units for:', prop)
+    for ft, ft_cache in cache.items():
+        if prop in ft_cache.keys():
+            f2p_cache = ft_cache[prop]
+            for f, p in f2p_cache.items():
+                assert prop in p and prop_unit_key in p
+                # TODO delete
+                # a crude check that the object is a pd.Series
+                #assert hasattr(p, 'shape'), 'not a series'
+                #
+                assert is_series(p), 'not a series'
+
+                if isnull(p):
+                    # TODO delete after it is clear it is equiv to my own
+                    # `isnull`
+                    # This was the old way I calculated it.
+                    assert pd.isnull(p[prop])
+                    #
+                    continue
+
+                # TODO should it be an error for units to not be specified?
+                # (probably, that's how i handle it in some lookup fns)
+                # (-> so delete any entries in cache that have null units!!!)
+                c_units = p[prop_unit_key]
+                assert prop_units.check(c_units), f'{prop_units} != {c_units}'
+
 atexit.register(save_cache)
 
 
@@ -324,7 +711,7 @@ def cached(fn):
     f, t = fn.__name__.split('2')
 
     #assert f in cache and t in cache[f], f'{f}->{t} not in cache'
-    # TODO maybe just handle correctly in init_cache / load_cache?
+    # TODO maybe just handle correctly in init_cache / load_state?
     # (would probably need to either hardcode new things to add alongside
     # any new conversion fn defs, or enumerate types from possible conversion
     # fn defs)
@@ -337,6 +724,8 @@ def cached(fn):
 
     # TODO maybe modify so manual hardcoding into `properties`
     # not required for fns referencing new "to" types?
+    # (above does this, but maybe prefer to enumerate fns rather than waiting
+    # for an add)
 
     # TODO maybe specifically only add kwargs that wrapped fn takes somehow,
     # rather than taking any kwargs, and assuming user is calling wrapped
@@ -344,7 +733,12 @@ def cached(fn):
     # (or how to lookup kwargs of wrapped fn post hoc?)
     # So this cached decorator doesnt change function __name__
     @functools.wraps(fn)
-    def cached_fn(f_val, ignore_cache=False, **kwargs):
+    def cached_fn(f_val, ignore_cache=False, ignore_cache_null=False, 
+        leave_nonnull_cache=False, **kwargs):
+        """
+        leave_nonnull_cache: if True, null values will not overwrite
+            cached non-null values.
+        """
         ft_cache = cache[f][t]
 
         verbose = False
@@ -357,12 +751,27 @@ def cached(fn):
 
         if not ignore_cache and f_val in ft_cache:
             t_val = ft_cache[f_val]
-            if verbose:
-                print(f"{fn.__name__}('{f_val}') returning {t_val} from cache")
-            return t_val
+            # TODO maybe also support same null checking that works 
+            # w/ all null series here? (currently just using for single elements
+            # where chemspider id is null though...) (comment is probably no
+            # longer relevant now that i'm using my own `isnull`, but check more
+            # closely)
+            if not ignore_cache_null or isnull(t_val):
+                if verbose:
+                    print(f"{fn.__name__}('{f_val}') returning {t_val} "
+                        "from cache"
+                    )
+                return t_val
 
         t_val = fn(f_val, **kwargs)
-        ft_cache[f_val] = t_val
+
+        # could maybe clean this conditional up
+        # TODO + test it
+        if not (leave_nonnull_cache and isnull(t_val) and
+            f_val in ft_cache and not isnull(ft_cache[f_val])):
+
+            ft_cache[f_val] = t_val
+
         return t_val
 
     return cached_fn
@@ -1058,6 +1467,8 @@ def normalize_name(name):
 def normalize_cas(cas):
     # TODO maybe remove first null check in convert if this is the expected
     # behavior of the norm fns? 
+    # TODO make a null_preserving decorator and use for each fn that has similar
+    # logic?
     if pd.isnull(cas):
         return cas
 
@@ -1073,6 +1484,7 @@ def pubchem_url(cid):
     return 'https://pubchem.ncbi.nlm.nih.gov/compound/{}'.format(cid)
 
 
+# TODO worth caching this too (w/ decorator)?
 def inchi2pubchem_url(inchi):
     cid = convert(inchi, from_type='inchi', to_type='cid')
     return pubchem_url(cid)
@@ -1204,7 +1616,6 @@ def compound2cid(compound):
 # name (as long as it doesn't depend on how the page is accessed...).
 # e.g. 'linalool' vs IUPAC '3,7-dimethylocta-1,6-dien-3-ol'
 def compound2name(compound):
-    # TODO this work? 
     return compound.iupac_name
 
 
@@ -1216,6 +1627,10 @@ def compound2inchi(compound):
     # TODO actually check format meets some minimum of the inchi standard
     assert len(inchi) > 0
     return inchi
+
+
+def compound2inchikey(compound):
+    return compound.inchikey
 
 
 def compound2cas(compound, verbose=False):
@@ -1292,7 +1707,6 @@ def chemspider_url(csid):
 def chemspider_experimental_density(csid, verbose=False):
     import requests
     from bs4 import BeautifulSoup
-    import time
 
     url = chemspider_url(csid)
     if verbose:
@@ -1317,7 +1731,14 @@ def chemspider_experimental_density(csid, verbose=False):
         # is parseble as valid density unit? use `pint` for that?
 
         parts = row.text.split()
-        curr_density = float(parts[0].strip())
+        try:
+            curr_density = float(parts[0].strip())
+        except ValueError:
+            if verbose:
+                print(url)
+                print('Failed to parse density from row text:', row.text)
+            #raise
+            return None
 
         # TODO ever need to parse this from multiple parts?
         # TODO need to handle null case?
@@ -1350,111 +1771,57 @@ def chemspider_experimental_density(csid, verbose=False):
 
 
 nist_url_prefix = 'http://webbook.nist.gov'
-def nist_webbook_url(inchi):
+def inchi2nist_webbook_url(inchi):
     inchi_str = 'InChI=' + inchi.replace('/','%2F').replace(',','%2C').replace(
         '+', '%2B')
     return f'{nist_url_prefix}/cgi/cbook.cgi?{inchi_str}&Units=SI'
 
 
-def nist_henrys_law_url(inchi):
-    return nist_webbook_url(inchi) + '&cSO=on'
+def inchi2nist_henrys_law_url(inchi):
+    return inchi2nist_webbook_url(inchi) + '&cSO=on'
 
 
-concentration_dimensionalities = [
-    '[length]^-3 [mass]',
-    # This seems to be how pint formats molarity (M).
-    '[length]^-3 [substance]'
-]
-preferred_concentration_unit = 'g/L'
-preferred_density_unit = 'g/mL'
-dimensionality2preferred_units = {
-    # TODO i guess this has the same dimensionality as 'density'??
-    # maybe don't just lookup via dimensionality then, if i want 
-    # different answers for density and concentration (g/L) inputs?
-    # TODO or some way to have two different substances in pint unit repr?
-    # (they'd be same in density case vs diff in conc case)
-    '[length]^-3 [mass]': preferred_concentration_unit,
-    '[length]^-3 [substance]': 'molar',
-    '[length]^-1 [mass] [time]^-2': 'kPa'
-}
-# Checking that pint parses all preferred units to the expected
-# dimensionality.
-for dim, preferred_unit_str in dimensionality2preferred_units.items():
-    assert ureg[preferred_unit_str].check(dim)
-
-# TODO maybe this should completely replace the above?
-property2preferred_units = {
-    'concentration': preferred_concentration_unit,
-    'density': preferred_density_unit,
-    # Just what NIST uses. May want to change.
-    'k_henry': 'mol / kg / bar',
-    'vapor_pressure': 'kPa',
-    'water_solubility': 'g / L',
-    # TODO want this here?
-    'molar_mass': 'g / mol'
-}
-# TODO maybe add to cache fn to check units of these if they are properties?
-for prop, preferred_unit_str in property2preferred_units.items():
-    prop_units = ureg[preferred_unit_str]
-    prop_unit_key = f'{prop}_units'
-    #print('checking cache units for:', prop)
-    for ft, ft_cache in cache.items():
-        if prop in ft_cache.keys():
-            f2p_cache = ft_cache[prop]
-            for f, p in f2p_cache.items():
-                assert prop in p and prop_unit_key in p
-                # a crude check that the object is a pd.Series
-                assert hasattr(p, 'shape'), 'not a series'
-                if pd.isnull(p[prop]):
-                    continue
-                # TODO should it be an error for units to not be specified?
-                # (probably, that's how i handle it in some lookup fns)
-                # (-> so delete any entries in cache that have null units!!!)
-                c_units = p[prop_unit_key]
-                assert prop_units.check(c_units), f'{prop_units} != {c_units}'
-
-
-def is_concentration_unit(units):
+# TODO maybe also add kwargs to specify maximum allowable temperature
+# deviations? or do none of the property fns actually return that?
+def opt_pint_return(property_fn):
     """
-    Returns whether a `pint` `Unit`/`Quantity` has dimensionality we accept as a
-    concentration.
+    Decorator for property lookup functions that adds a boolean `pint` kwarg to
+    return a pint Unit object instead of the default pandas Series.
+
+    If the function to be wrapped returns `None`, so does the wrapped version.
+    If it returns a pandas Series with all null values, `None` is returned.
+
+    The function must take an InChI input (without the 'InChI=' prefix), and it
+    must return a pandas Series with '<property>' and '<property>_units' as
+    keys (with numeric and a `str` with parseable units, respectively).
+
+    The pandas Series may have slightly more information, such as the source of
+    the lookup information.
     """
-    # This is to detect the pint Unit class, as opposed to Quantity.
-    if not hasattr(units, 'u'):
-        # Since units don't have the same check methods as quantities.
-        quantity = ureg.Quantity(1, units)
-    else:
-        quantity = units
+    _, prop_name = property_fn.__name__.split('2')
 
-    return any([quantity.check(d) for d in concentration_dimensionalities])
+    @functools.wraps(property_fn)
+    def wrapped_prop_fn(inchi, pint=False, **kwargs):
+        series = property_fn(inchi, **kwargs)
+        if not pint:
+            return series
 
+        if isnull(series):
+            return None
 
-def in_expected_units(expected_units, test_units):
-    """Returns whether `expected_units` and `test_units` are equivalent.
+        assert prop_name in series
+        # TODO check to ensure property is numeric?
+        unit_key = prop_name + '_units'
+        assert unit_key in series
 
-    `expected_units` must be one of `None` or a `str` that is either
-        'concentration', 'density', or something `pint` can parse.
+        unit_str = series[unit_key]
+        assert type(unit_str) is str
 
-    `test_units` is a `pint` `Quantity` or `Unit` object.
+        quantity = ureg.Quantity(series[prop_name], unit_str)
+        return quantity
 
-    Equivalent in the sense that they share the same number of factors of each
-    base unit type.
-    """
-    # Lone numbers, for instance, parse to dimensionless units.
-    if expected_units is None:
-        return not test_units.dimensionless
-
-    elif expected_units == 'concentration':
-        return is_concentration_unit(test_units)
-
-    elif expected_units == 'density':
-        return (test_units.dimensionality ==
-            ureg[preferred_density_unit].dimensionality
-        )
-
-    else:
-        return test_units.dimensionality == ureg[expected_units].dimensionality
-
+    return wrapped_prop_fn
+    
 
 @cached
 def cid2molar_mass(cid):
@@ -1475,6 +1842,7 @@ def cid2molar_mass(cid):
 
 # TODO TODO should try to pass ignore_cache of this wrapped fn (wrapper adds the
 # kwarg) through to the cid2molar_mass lookup, right?
+@opt_pint_return
 @cached
 def inchi2molar_mass(inchi):
     cid = convert(inchi, from_type='inchi', to_type='cid')
@@ -1502,7 +1870,7 @@ def try_parse_units(string):
     except TokenError:
         pass
 
-    # This happens if p == ':'
+    # This happens if p == ':' (p?)
     except AttributeError as e:
         assert str(e) == "'NoneType' object has no attribute 'evaluate'"
 
@@ -1518,41 +1886,71 @@ def try_parse_units(string):
     return curr_units
 
 
+def degree_str2unit(temp_unit_str):
+    if temp_unit_str == 'C':
+        temp_unit = ureg.degC
+
+    elif temp_unit_str == 'F':
+        temp_unit = ureg.degF
+
+    elif temp_unit_str == 'K':
+        temp_unit = ureg.degK
+
+    # Although since the regex specifies there must be one of the CFK
+    # characters, this should not be reached unless the regex changes.
+    else:
+        raise ValueError('unexpected temperature unit str')
+
+    return temp_unit
+
+
+def _match_groups_range_mean(groups):
+    """Returns mean of range when given match groups.
+
+    Assumes first two groups have str min and max of range.
+    """
+    range_min = float(groups[0])
+    range_max = float(groups[1])
+    assert range_min < range_max, 'range not in expected order'
+    quantity = range_min + (range_max - range_min) / 2
+    return quantity
+
+
 float_re = r'(\d+(?:,\d{3})*(?:\.\d*)?)'
+float_range_re = float_re + r'\s?(?:-|to)\s?' + float_re
 # TODO also need to match case where degree sign is not there?
 # case where F/C not there (maybe C assumed?)?
 # TODO maybe check there were not multiple matches to this regex
-temp_re = r'(?:@|at)\s*' + float_re + r'\s*°\s*([CFK])'
+_at_re = r'(?:@|at)\s*'
+degree_re = r'\s*°\s*([CFK])'
+temp_re = _at_re + float_re + degree_re
+temp_range_re = _at_re + float_range_re + degree_re
+
 def parse_temperature_c(string):
     """Returns None or scalar temparture in celsius and part of string not used.
     """
     match = re.search(temp_re, string)
     if match is None:
-        return None, string
+        match = re.search(temp_range_re, string)
+        if match is None:
+            return None, string
+        else:
+            groups = match.groups()
+            temp_unit = degree_str2unit(groups[-1])
+            rmean = _match_groups_range_mean(groups)
+            temperature = ureg.Quantity(rmean, temp_unit).to(ureg.degC)
+
+            string = re.sub(temp_range_re, '', string)
     else:
         groups = match.groups()
-        temp_unit_str = groups[-1]
-        if temp_unit_str == 'C':
-            temp_unit = ureg.degC
-
-        elif temp_unit_str == 'F':
-            temp_unit = ureg.degF
-
-        elif temp_unit_str == 'K':
-            temp_unit = ureg.degK
-
-        # Although since the regex specifies there must be one of the CFK
-        # characters, this should not be reached unless the regex changes.
-        else:
-            raise ValueError('unexpected temperature unit str')
-
+        temp_unit = degree_str2unit(groups[-1])
         temperature = ureg.Quantity(float(groups[0]), temp_unit).to(ureg.degC)
 
         # Remove matched part of the string before search for units and
         # quantities below (with the goal of making the search below easier).
         string = re.sub(temp_re, '', string)
 
-        return temperature.magnitude, string
+    return temperature.magnitude, string
 
 
 # TODO maybe have "Insoluble in water" / "Insol in water..." return some small
@@ -1582,6 +1980,8 @@ def parse_pubchemprops_string(string, expected_units=None, target_temp_c=None):
     Assumes any values that would otherwise return exactly 0.0 return `None`,
     to not cause calculations to fail for lack of the real small value.
     """
+    orig_str = string
+
     if target_temp_c is None:
         target_temp_c = 25.0
 
@@ -1637,16 +2037,13 @@ def parse_pubchemprops_string(string, expected_units=None, target_temp_c=None):
     parsed_dict['from_range'] = False
 
     # First part means match either whitespace or the start of the string.
-    range_re = r'(?:^|\s)' + float_re + r'\s?(?:-|to)\s?' + float_re
+    range_re = r'(?:^|\s)' + float_range_re
     match = re.search(range_re, string)
     if match is not None:
         parsed_dict['from_range'] = True
 
         groups = match.groups()
-        range_min = float(groups[0])
-        range_max = float(groups[1])
-        assert range_min < range_max, 'range not in expected order'
-        quantity = range_min + (range_max - range_min) / 2
+        quantity = _match_groups_range_mean(groups)
 
         # Assuming we won't need to check for inequalities in this range case.
         parts_before_quantity = []
@@ -1658,6 +2055,10 @@ def parse_pubchemprops_string(string, expected_units=None, target_temp_c=None):
     # TODO maybe use regex for this. implement more general correctly handling
     # somewhere else? didn't i already have one hack for something like this?
     string = string.replace('/cu cm', '/mL')
+
+    # Assuming we can remove all parenthetical stuff that remains
+    # (source was already parsed and removed above) without issue.
+    string = re.sub(r'\(.+\)', '', string)
 
     parts = string.strip().split()
 
@@ -1684,7 +2085,17 @@ def parse_pubchemprops_string(string, expected_units=None, target_temp_c=None):
             parts_before_quantity = list(remaining_parts)
             quantity = curr_quantity
         else:
-            raise ValueError(f'multiple parseable quantities in str "{string}"')
+            # TODO how to handle cases like:
+            # https://pubchem.ncbi.nlm.nih.gov/compound/22311
+            # "0.25 to 0.67 kPa at 20 °C (1.9 to 5 mm Hg)"
+            # where there is redundant parentheical information?
+            # can i always throw out parenthetical stuff, or would that
+            # screw up some cases that previously worked?
+            # TODO TODO implement fn to check changes against all cached lookup
+            # values!
+            raise ValueError('multiple parseable quantities in remaining '
+                f'{string}\nfull str: {orig_str}'
+            )
 
     if quantity is None:
         return null_dict
@@ -1775,7 +2186,9 @@ def parse_pubchemprops_string(string, expected_units=None, target_temp_c=None):
         if units is None:
             units = curr_units
         else:
-            raise ValueError('multiple unit definitions')
+            raise ValueError('multiple unit definitions. remaining: '
+                f'{remaining_str}\nfull: {orig_str}'
+            )
 
     # One case that triggers this: "2 % (NIOSH, 2016)"
     if units is None:
@@ -1855,6 +2268,17 @@ def pubchemprops_lookup(inchi, prop_name, expected_units=None,
                 parsed_dict['temperature_c'] = temp_c
 
                 unit_str = unit_str.replace('()','').strip()
+
+                # This is to special case one instance where the unit_str was
+                # 'mg/mL, clear, colorless'. Probably no cases where I want
+                # everything surrounding a comma, though this may not always be
+                # right...
+                if ',' in unit_str:
+                    unit_str = unit_str.split(',')[0].strip()
+                    assert len(unit_str) > 0, ('hack to fix unit str with extra'
+                        ' info following comma failed'
+                    )
+
                 units = ureg[unit_str]
                 assert in_expected_units(expected_units, units)
                 parsed_dict['units'] = units.u
@@ -1986,6 +2410,7 @@ def pubchemprops_lookup(inchi, prop_name, expected_units=None,
 # "Soluble in 120 parts water at 25 °C" (l25)
 # maybe this and all the other NIOSH stuff
 # "5 % (NIOSH, 2016)" (l39)
+@opt_pint_return
 @cached
 def inchi2water_solubility(inchi, verbose=False):
     ret_keys = [
@@ -2017,6 +2442,7 @@ def inchi2water_solubility(inchi, verbose=False):
     })
 
 
+@opt_pint_return
 @cached
 def inchi2vapor_pressure(inchi, verbose=False):
     ret_keys = [
@@ -2041,8 +2467,57 @@ def inchi2vapor_pressure(inchi, verbose=False):
     })
 
 
+# TODO TODO so is list of results just empty after i pass api call limit?
+# some way to detect and notify about that? (b/c all but first few of 
+# a series of url lookups seemed to be null...)
 @cached
-def inchi2density(inchi, chemspipy_api_key=None, verbose=False):
+def inchi2chemspider_id(inchi):
+    from chemspipy import ChemSpider
+
+    if chemspipy_api_key is None:
+        raise RuntimeError('chemspipy_api_key must be set to use '
+            'inchi2chemspider_id. call set_chemspipy_api_key(key).'
+        )
+
+    # TODO crude rate limiting. may be redundant w/ stuff in chemspipy code?
+    time.sleep(1.0)
+    #
+    cs = ChemSpider(chemspipy_api_key)
+    # Docs seem to claim inchi could be passed just as if it were name,
+    # but my testing did not seem to bear that out.
+    inchi_with_prefix = 'InChI=' + inchi
+
+    # TODO TODO TODO need to implement my own rate limiting here to avoid
+    # getting results.exception w/ message='Too Many Requests' ??
+    # (didn't seem to fix the problem, w/ my own 1s sleep...)
+    # (some longer lockout period once it triggers? email them?)
+
+    #print(results)
+    #import ipdb; ipdb.set_trace()
+
+    # TODO handle lookup failure here
+    results = cs.search(inchi_with_prefix, domain='inchi')
+    # TODO is this the right way null case?
+    if len(results) == 0:
+        return None
+
+    csid = min([r.csid for r in results])
+    return csid
+
+
+# TODO TODO maybe return url that achieves search for inchi if csid is null
+# (particularly if that can happen just b/c api call limit exceeded or
+# something)? possible?
+def inchi2chemspider_url(inchi, **kwargs):
+    csid = inchi2chemspider_id(inchi, **kwargs)
+    if csid is None:
+        return None
+    return chemspider_url(csid)
+
+
+@opt_pint_return
+@cached
+def inchi2density(inchi, verbose=False):
     ret_keys = ['density', 'density_sources', 'density_units']
     null_ret = pd.Series({k: None for k in ret_keys})
 
@@ -2060,33 +2535,29 @@ def inchi2density(inchi, chemspipy_api_key=None, verbose=False):
 
     # TODO maybe cache these separately if we can't tell where None came from?
     if chemspipy_api_key is None:
-        # TODO probably warn here, since we might are missing one way to 
-        # look up this value.
-        #return None
+        warnings.warn('could not lookup density on chemspider b/c no '
+            'chemspipy_api_key set. call set_chemspipy_api_key(key) if '
+            'desired.'
+        )
         return null_ret
 
-    # TODO in the future, only warn if any are missing
-    from chemspipy import ChemSpider
+    # TODO in the future, only warn if any are missing (?)
 
-    cs = ChemSpider(chemspipy_api_key)
-    # Docs seem to claim inchi could be passed just as if it were name,
-    # but my testing did not seem to bear that out.
-    # TODO probably also cache these (if using for anything other than density)
-    inchi_with_prefix = 'InChI=' + inchi
-    results = cs.search(inchi_with_prefix, domain='inchi')
-    # TODO is this the right way null case?
-    if len(results) == 0:
+    # TODO this inchi guaranteed to be non-null?
+    # TODO pass ignore_cache through to this if applicable
+    # TODO TODO again maybe ignore_cache should just be set globally to make
+    # this possible?
+    # TODO TODO in future, look for availability of properties in any associated
+    # compounds, and average anything found.
+    # (for now, just using lowest compound ID as a hack)
+    csid = inchi2chemspider_id(inchi)
+
+    if csid is None:
         if verbose:
             print('COULD NOT FIND INCHI IN CHEMSPIDER')
 
         return null_ret
 
-    # TODO handle lookup failure here / above
-
-    # TODO TODO in future, look for availability of properties in any associated
-    # compounds, and average anything found.
-    # (for now, just using lowest compound ID as a hack)
-    csid = min([r.csid for r in results])
 
     # TODO could enable behind some flag for extra checks
     #result = [r for r in results if r.csid == csid][0]
@@ -2117,13 +2588,14 @@ def inchi2density(inchi, chemspipy_api_key=None, verbose=False):
 
 # TODO get temp dependence coeff if available
 # TODO assert temp it's defined at is same-ish (or is it always same?)?
+
+@opt_pint_return
 @cached
-def inchi2k_henry(inchi, verbose=True):
+def inchi2nist_k_henry(inchi, verbose=False):
     import requests
     from bs4 import BeautifulSoup
-    import time
 
-    url = nist_henrys_law_url(inchi)
+    url = inchi2nist_henrys_law_url(inchi)
     if verbose:
         print(url)
 
@@ -2199,11 +2671,10 @@ def inchi2k_henry(inchi, verbose=True):
         if verbose:
             print('NO HENRY LAW DATA\n')
 
-        return pd.Series({
-            'k_henry': None,
-            'k_henry_sources': None,
-            'k_henry_units': None
-        })
+        # TODO TODO check this doesn't break any possible places
+        # i assumed things w/ series output in some cases always have series
+        # output...
+        return None
 
     # TODO ever have multiple w/ best method and presence of ref?
     # need to resolve across them?
@@ -2252,12 +2723,11 @@ def inchi2k_henry(inchi, verbose=True):
     # dependence coefficient, method, and reference (use dict or pd.Series)
     # + service / database if using options besides NIST
     # (also implement in inchi2density)
-    
+
     if verbose:
         print('Kh:', kh)
         print()
 
-    # TODO dict OK or need pd.Series to get multiple col output behavior?
     # TODO if possible, maybe factor return of all these prop lookup fns
     # to fill in property name and prefix sources and units cols w/
     # that property name?
@@ -2269,8 +2739,117 @@ def inchi2k_henry(inchi, verbose=True):
     })
 
 
-def add_properties(df, props=None, chemspipy_api_key=None, verbose=False,
-    **kwargs):
+mp_henry_prefix = 'http://satellite.mpic.de/henry/'
+def inchikey2maxplanck_k_henry_url(inchikey):
+    return f'{mp_henry_prefix}search_identifier.html?search={inchikey}'
+
+
+# TODO conversion to inchikey best done in here or outside?
+# TODO uncomment decorators after getting this to work
+#@opt_pint_return
+#@cached
+def inchi2maxplanck_k_henry(inchi, verbose=False):
+    """
+    Looks up Henry's law constant at:
+    http://satellite.mpic.de/henry (redirected from http://www.henrys-law.org)
+
+    The site was made by Rolf Sander.
+
+    It says on its homepage that data from temperatures above 373K (~100C)
+    were not used, but that might still mean some data is at temperatures
+    somewhat different from what we want.
+    """
+    # TODO the PDF compilations he publish have anything the site doesn't?
+    # TODO anyway to get a download of the data? request?
+    import requests
+    from bs4 import BeautifulSoup
+
+    inchikey = convert(inchi, from_type='inchi', to_type='inchikey')
+
+    url = inchikey2maxplanck_k_henry_url(inchikey)
+    #
+    print(url)
+    #
+    response = requests.get(url)
+    html = response.text
+
+    # This parser is case insensitive (useful here).
+    # Requires: pip install lxml
+    soup = BeautifulSoup(html, 'xml')
+    tags = soup.findAll('h1')
+    # Website must have changed if this happens.
+    assert len(tags) == 1
+    tag = tags[0]
+    n_results = int(tag.text.split()[0])
+    assert n_results >= 0
+    if n_results == 0:
+        return None
+
+    if n_results > 1:
+        print('>1 results for this inchikey')
+        import ipdb; ipdb.set_trace()
+
+    # not sure why it requires two next_sibling calls rather than 1...
+    # from looking at source it seems like maybe it should be 1
+    table = tag.next_sibling.next_sibling
+    # assuming all links in table would go to same place
+    # (and that there are links) (both assumptions seem true for now)
+    url_suffix = '/'.join(table.find('a')['href'].split('/')[-2:])
+    url = mp_henry_prefix + url_suffix
+
+    # TODO want to sleep between this request and the above?
+
+    # TODO TODO TODO use his (what seems like) temperature dependence data
+    # (but how?) (same w/ nist stuff still...)
+    # (the "d ln Hcp / d (1/T)" column)
+
+    # TODO maybe download the whole page to some webpage cache, and then
+    # reprocess stuff from there (so i can change my criteria / average across
+    # different subsets of table rows) w/o having to make more requests?
+    # (maybe some idiomatic way to make these kinds of caches?)
+    # (and would probably want to do w/ all things i scrape manually w/
+    # beautifulsoup)
+
+    response = requests.get(url)
+    html = response.text
+    soup = BeautifulSoup(html, features='html.parser') #'xml')
+
+    tags = soup.findAll('TH', text='Type')
+    assert len(tags) == 1
+    table = tags[0].parent.parent
+
+    # TODO TODO average over all of the most-reliable kind of data (e.g. M for
+    # measured)? or does he even have meaningful order of reliability even
+    # within there (so should i just take first row?)?
+    tag = table.find('td')
+
+    import ipdb; ipdb.set_trace()
+    time.sleep(0.5)
+
+
+# TODO TODO k_henry data ever available in chemspipy (or chemspider more
+# generally...)? (i think so, sometimes? also think i might have seem in
+# pubchem sometimes?)
+@opt_pint_return
+@cached
+def inchi2k_henry(inchi, verbose=False):
+    # TODO TODO thread ignore_cache through (kwargs work for that, or 
+    # would kwargs here not apply to the wrapped inchi2k_henry?)
+    keys = ['k_henry', 'k_henry_sources', 'k_henry_units']
+
+    for fn in (inchi2nist_k_henry, inchi2maxplanck_k_henry):
+        ret = fn(inchi, verbose=verbose)
+        if ret is not None:
+            assert pd.notnull(ret['k_henry'])
+            for k in keys:
+                assert k in ret.keys()
+            # TODO also check it's a series (not a dict, for instance)
+            return ret
+
+    return pd.Series({k: None for k in keys})
+
+
+def add_properties(df, props=None, verbose=False):
     """Adds chemicals properties to DataFrame `df` with `inchi` in columns.
     """
     # Checking it's a DataFrame
@@ -2299,20 +2878,161 @@ def add_properties(df, props=None, chemspipy_api_key=None, verbose=False,
         else:
             kwarg_check_fn = inchi2prop_fn
 
-        curr_kwargs = dict(kwargs)
-        if allowed_kwarg(kwarg_check_fn, 'chemspipy_api_key'):
-            curr_kwargs.update({'chemspipy_api_key': chemspipy_api_key})
-            if verbose:
-                print('This function takes chemspipy_api_key. Passing')
-        else:
-            if verbose:
-                print('This function does NOT take chemspipy_api_key.')
-
         # This will probably fail if either kwargs are not accepted,
         # or columns returned do not match.
-        df[new_cols] = df.inchi.apply(inchi2prop_fn, verbose=verbose,
-            **curr_kwargs
+        df[new_cols] = df.inchi.apply(inchi2prop_fn, verbose=verbose)
+
+    return df
+
+
+# https://stackoverflow.com/questions/19153462
+_LETTERS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+def index2excel_col_name(i):
+    """ Convert given column number (0-indexed) to an Excel-style cell name. """
+    i = i + 1
+    result = []
+    while i:
+        i, rem = divmod(i - 1, 26)
+        result[:0] = _LETTERS[rem]
+    return ''.join(result)
+
+
+def load_or_save_excel_properties(df, excel_fname, name='', props=None,
+    overwrite_excel=False, verbose=False, all_urls=True):
+    """Saves `df` with properties to `excel_fname` for missing value entry.
+
+    All properties are looked up before the spreadsheet is written.
+
+    If `excel_fname` already exists, it is loaded instead of being written to,
+    and any new values are added to the cache, for all future lookups.
+
+    `df` is assumed to already have ['name','inchi'] among its columns.
+
+    `df` argument is ignored if spreadsheet will be loaded.
+    """
+    if props is None:
+        props = properties
+    else:
+        for p in props:
+            if p not in properties:
+                raise ValueError(f'props must all be in {properties}')
+
+    if name != '':
+        name += ' '
+
+    if overwrite_excel or not exists(excel_fname):
+        assert 'name' in df.columns and 'inchi' in df.columns
+
+        if 'pubchem_url' not in df.columns:
+            df['pubchem_url'] = df.inchi.map(inchi2pubchem_url)
+
+        if all_urls:
+            # TODO uncomment after lockout expires / after fixing issue
+            '''
+            if 'chemspider_url' not in df.columns:
+                #df['chemspider_url'] = df.inchi.map(inchi2chemspider_url)
+                df['chemspider_url'] = df.inchi.map(lambda x:
+                    inchi2chemspider_url(x, ignore_cache_null=True,
+                    leave_nonnull_cache=True)
+                )
+            '''
+
+            if 'nist_webbook_url' not in df.columns:
+                df['nist_webbook_url'] = df.inchi.map(inchi2nist_webbook_url)
+
+        add_properties(df, props, verbose=verbose)
+
+        property_cols = [c for p in props for c in
+            [p, f'{p}_units', f'{p}_sources']
+        ]
+        url_cols = [c for c in df.columns if c.endswith('_url')]
+        col_order = ['name'] + property_cols + url_cols + ['inchi']
+        other_cols = [c for c in df.columns if c not in col_order]
+        col_order += other_cols
+
+        df = df[col_order].copy()
+
+        def color_values_from_lookup(val):
+            # Empty cells would otherwise still have the text this color
+            # when it *is* manually entered.
+            color = 'black' if pd.isnull(val) else 'gray'
+            return f'color: {color}'
+                
+        print(f'Writing {name}to {excel_fname} for manual entry of missing '
+            'properties.'
         )
+        writer = pd.ExcelWriter(excel_fname, engine='xlsxwriter')
+
+        styled = df.style.applymap(color_values_from_lookup, subset=props)
+        #styled = df
+        styled.to_excel(writer, index=False)
+
+        # A dict of sheet name -> Worksheet objects.
+        assert len(writer.sheets) == 1
+        # Default sheet name is Sheet1
+        worksheet = writer.sheets['Sheet1']
+
+        workbook = writer.book
+        fmt = workbook.add_format()
+
+        # TODO some way to say scientific only for values small / large enough?
+        # i want that?
+        # 'Scientific' does not produce meaningful number outputs, though
+        # docs seemed to suggest that at least something like that would work
+        #fmt.set_num_format('Scientific')
+
+        # TODO TODO some way to only show a certain number of sigfigs???
+        # (with or without scientific format)
+        # TODO also don't set this format for columns just that have integer
+        # values (like in_dweck_active)
+        # TODO TODO why is this not working anymore?
+        # (i think it just will not apply to any stuff pandas has already styled
+        # (bug?), so i'll need to implement my formatting logic inside calls to
+        # write individual cells... (possible?) (or missing value conditional
+        # text color and still use set_column?))
+        fmt.set_num_format('0.000')
+
+        # TODO potentially see worksheet.write_url as for a way to eliminate
+        # default red formatting of urls
+        # TODO and the FAQ says it can't autofit column widths, but it does
+        # seem to indicate you can determine width of text after writing:
+        # how to do this with pandas???
+        # (for now, using write of str repr of input as proxy, which may fail
+        # badly for floats)
+
+        # TODO also turn off going beyond bounds of column for these?
+        # (like when next cols in same row are null)
+        # (and then move url_cols back before property_cols)
+        fixed_col_widths = {
+            'chemspider_url': len('chemspider_url'),
+            'nist_webbook_url': len('nist_webbook_url')
+        }
+        max_col_widths = df.applymap(lambda x: len(str(x))).max(axis=0)
+        for i, w in enumerate(max_col_widths):
+            n = df.columns[i]
+            if n in fixed_col_widths:
+                w = fixed_col_widths[n]
+            else:
+                # So column names are also considered. Could maybe do once
+                # before loop...
+                w = max(w, len(n))
+
+            c = index2excel_col_name(i)
+            r = f'{c}:{c}'
+            # I thought integers were supposed to work for first argument,
+            # but they did not.
+            worksheet.set_column(r, w, fmt)
+
+        writer.save()
+
+        # TODO TODO automated checks that all things (non-nan) are either equal
+        # or np.allclose (i checked manually and it's true)
+        #rt = pd.read_excel(excel_fname)
+
+    else:
+        print(f'Reading {name}property data from', excel_fname)
+        df = pd.read_excel(excel_fname)
+        add_properties_to_cache(df, verbose=verbose)
 
     return df
 
@@ -2336,6 +3056,32 @@ def add_properties_to_cache(df, overwrite_close=False, dropna=True,
             preferred_unit_str = property2preferred_units[prop]
             preferred_units = ureg[preferred_unit_str]
             inchi2prop_cache = cache['inchi'][prop]
+            # TODO this work? test
+            def add_to_cache(i, p, row):
+                nonlocal add_count
+
+                # TODO maybe move unit conversion (currently in loop below)
+                # up here, so it's clear we are converting, and not just setting
+                # the unit_str to something different...
+
+                # TODO maybe a fn for making these? (including null ones)
+                new_entry = pd.Series({
+                    prop: p,
+                    f'{prop}_sources': getattr(row, f'{prop}_sources'),
+                    f'{prop}_units': preferred_unit_str
+                })
+
+                # TODO should also make sure that whitespace only strings aren't
+                # accepted (maybe check it's a url?)
+                # If I don't want this error condition, should support adding
+                # sources after previous entry of a value.
+                if pd.isnull(getattr(row, f'{prop}_sources')):
+                    raise ValueError(f'{row.Index} {prop} missing source')
+
+                inchi2prop_cache[i] = new_entry
+                is_manual[('inchi', prop, i)] = True
+                add_count += 1
+            #
 
             if verbose:
                 print(f'adding {prop}')
@@ -2343,41 +3089,64 @@ def add_properties_to_cache(df, overwrite_close=False, dropna=True,
             cols = [prop, f'{prop}_sources', f'{prop}_units']
             assert all([c in df.columns for c in cols[1:]])
 
+            # TODO probably factorize out conversion of units on a df
+            # (also want to do something similar in fn to load hardcoded manual
+            # properties, though that spreadsheet is in a different format)
+
             for row in df[cols].dropna(subset=[prop]).itertuples():
+                # TODO TODO maybe change so that i can more easily clear things
+                # already entered (by deleting that row in spreadsheet and
+                # re-adding) (delete existing stuff in cache if valueerror,
+                # before raising (and if `is_manual` is True for it)?)
+
+                # TODO for all these errors, try to use name rather than inchi
+                # (at least if available)
 
                 # Since usual dict key indexing doesn't work w/ itertuples
                 # objects.
                 unit_str = getattr(row, f'{prop}_units')
-                assert preferred_units.check(unit_str), \
-                    f'inconsistent units {preferred_unit_str} and {unit_str}'
+                if pd.isnull(unit_str):
+                    raise ValueError(f'{row.Index} {prop} missing units')
+
+                if not preferred_units.check(unit_str):
+                    raise ValueError(f'{row.Index} {prop} units of {unit_str} '
+                        f'inconsistent with {preferred_unit_str}'
+                    )
 
                 # TODO TODO may need extra lookup of molar mass if want to
                 # convert between concentration units of different
                 # dimensionality...
 
-                q = (getattr(row, prop) * ureg[unit_str]).to(preferred_unit_str
-                    ).magnitude
+                # TODO probably vectorize this numeric check
+                m = getattr(row, prop)
+                try:
+                    float(m)
+                except ValueError:
+                    raise ValueError(f'{row.Index} {prop} not a number')
 
-                # TODO maybe a fn for making these? (including null ones)
-                new_entry = pd.Series({
-                    prop: q,
-                    f'{prop}_sources': getattr(row, f'{prop}_sources'),
-                    f'{prop}_units': preferred_unit_str
-                })
+                q = (m * ureg[unit_str]).to(preferred_unit_str).magnitude
 
                 inchi = row.Index
                 if inchi not in inchi2prop_cache:
                     if verbose:
-                        print(f'adding {inchi} not already in property cache')
-                    inchi2prop_cache[inchi] = new_entry
-                    add_count += 1
+                        print(f'adding {inchi} not already in cache')
+                    #inchi2prop_cache[inchi] = new_entry
+                    #add_count += 1
+                    add_to_cache(inchi, q, row)
                     continue
+
+                # TODO replace w/ isnull(inchi2prop_cache[inchi]), or no?
+                if pd.isnull(inchi2prop_cache[inchi][prop]):
+                    if verbose:
+                        print(f'adding {inchi} null in cache')
+                    add_to_cache(inchi, q, row)
 
                 if not np.isclose(inchi2prop_cache[inchi][prop], q):
                     if verbose:
                         print(f'adding {inchi} b/c not close to cache value')
-                    inchi2prop_cache[inchi] = new_entry
-                    add_count += 1
+                    add_to_cache(inchi, q, row)
+                    #inchi2prop_cache[inchi] = new_entry
+                    #add_count += 1
                 else:
                     if verbose:
                         print(f'not adding {inchi} b/c close to cache value')
@@ -2408,7 +3177,6 @@ def odor_inventory_gsheet(use_cache=False, verbose=False):
         with open(gsheet_cache_file, 'rb') as f:
             df = pickle.load(f)
     else:
-        pkg_data_dir = split(__file__)[0]
         with open(
             join(pkg_data_dir, 'odor_inventory_sheet_link.txt'), 'r') as f:
 
