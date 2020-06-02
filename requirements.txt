@@ -1,5 +1,0 @@
-pubchempy
-pandas
-# So that pandas can actually write Excel files.
-xlrd
-pint
