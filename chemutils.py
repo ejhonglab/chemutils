@@ -1393,10 +1393,27 @@ def normalize_name(name):
     # TODO maybe similar length condition on stuff before open paren?
     # .{3,} means "at least 3 of any character"
     # Square bracket part means "any character but parentheses"
-    name = re.sub(r'\([^\(\)]{4,}\)', '', name)
+    # TODO TODO TODO was this causing the parts[0] IndexError on Virginie's
+    # compiled data?
+    # Added $ (end of string) 2020-06-17
+    name = re.sub(r'\([^\(\)]{4,}\)$', '', name)
 
     parts = name.split()
-    normed_name = parts[0]
+
+    # TODO TODO delete try / except, after ensuring it won't happen
+    try:
+        normed_name = parts[0]
+    except IndexError:
+        warnings.warn('hacky fix to IndexError in normalize_name still there!')
+        # TODO TODO TODO why were these names empty? cas? am i throwing away
+        # important stuff?
+        '''
+        print(name)
+        print(type(name))
+        raise
+        '''
+        return None
+
     for a, b in zip(parts, parts[1:]):
         # We don't want to join adjacent words, or after comma.
         if a[-1] == ',' or (a[-1].isalpha() and b[0].isalpha()):
@@ -1481,11 +1498,15 @@ def normalize_cas(cas):
 
 
 def pubchem_url(cid):
+    if pd.isnull(cid):
+        return cid
     return 'https://pubchem.ncbi.nlm.nih.gov/compound/{}'.format(cid)
 
 
 # TODO worth caching this too (w/ decorator)?
 def inchi2pubchem_url(inchi):
+    if pd.isnull(inchi):
+        return inchi
     cid = convert(inchi, from_type='inchi', to_type='cid')
     return pubchem_url(cid)
 
