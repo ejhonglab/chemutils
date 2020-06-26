@@ -516,6 +516,7 @@ def clear_cache(*args):
         cache = init_cache()
 
     elif len(args) == 2:
+        # args: (from_type, to_type)
         _clear_one_cache(*args)
 
     elif len(args) == 3:
@@ -963,6 +964,12 @@ def convert(chem_id, from_type=None, to_type='inchi', verbose=False,
     if check_one2one:
         raise NotImplementedError
 
+    valid_ignore_cache_vals = (True, False, 'if_null')
+    if ignore_cache not in valid_ignore_cache_vals:
+        raise ValueError(
+            f'ignore_cache must be one of: {valid_ignore_cache_vals}'
+        )
+
     could_keep_originals = False
     # TODO test w/ index/series/df (w/ index / columns of matching name)
     if hasattr(chem_id, 'shape') and len(chem_id.shape) > 0:
@@ -1245,37 +1252,50 @@ def convert(chem_id, from_type=None, to_type='inchi', verbose=False,
     # direction is filled (CID <-> inchi? definitely inchikey <-> inchi, right?)
     # ...and do they have to be 1:1?
 
-    if not ignore_cache:
+    #if not ignore_cache:
+    #if ignore_cache == False or ignore_cache == 'if_null':
+    if ignore_cache != True:
         # TODO should this fail into elif if cached value is None?
         # (be consistent w/ all branches on try_non_normalized)
         if chem_id in cache[from_type][to_type]:
             val = cache[from_type][to_type][chem_id]
-            if verbose:
-                print('Returning {} from cache'.format(val))
-            return val
+            # TODO need other handling of ignore_cache == False case?
+            if not (ignore_cache == 'if_null' and pd.isnull(val)):
+                if verbose:
+                    print('Returning {} from cache'.format(val))
+                return val
 
         elif try_non_normalized and old_chem_id in cache[from_type][to_type]:
             val = cache[from_type][to_type][old_chem_id]
-            if verbose:
-                # TODO here and in other similar places, replace
-                # 'chem_id' w/ value of `from_type`
-                print('Falling back to non-normalized chem_id')
-                print('Returning {} from cache'.format(val))
-            return val
+            # TODO need other handling of ignore_cache == False case?
+            if not (ignore_cache == 'if_null' and pd.isnull(val)):
+                if verbose:
+                    # TODO here and in other similar places, replace
+                    # 'chem_id' w/ value of `from_type`
+                    print('Falling back to non-normalized chem_id')
+                    print('Returning {} from cache'.format(val))
+                return val
 
-    if not ignore_cache and chem_id in cache[from_type]['cid']:
+    # Added 2020-06-25 as part of trying to add ignore_cache == 'if_null'
+    # support.
+    cid = None
+
+    #if not ignore_cache and chem_id in cache[from_type]['cid']:
+    if ignore_cache != True and chem_id in cache[from_type]['cid']:
         cid = cache[from_type]['cid'][chem_id]
         if verbose:
             print('{} of type {} had CID {} in cache'.format(chem_id, from_type,
                 cid
             ))
         if cid is None:
-            if verbose:
-                print('CID in cache was None!')
-            conversion_fail_err()
-            return None
+            if ignore_cache != 'if_null':
+                if verbose:
+                    print('CID in cache was None!')
+                conversion_fail_err()
+                return None
 
-    elif (not ignore_cache and try_non_normalized and
+    #elif (not ignore_cache and try_non_normalized and
+    elif (ignore_cache != True and try_non_normalized and
         old_chem_id in cache[from_type]['cid']):
 
         cid = cache[from_type]['cid'][old_chem_id]
@@ -1285,11 +1305,18 @@ def convert(chem_id, from_type=None, to_type='inchi', verbose=False,
                 from_type, cid
             ))
         if cid is None:
-            if verbose:
-                print('CID in cache was None!')
-            conversion_fail_err()
-            return None
-    else:
+            # TODO could probably handle this once below in `if cid is None`
+            # case, rather than here and in `if` above...
+            if ignore_cache != 'if_null':
+                if verbose:
+                    print('CID in cache was None!')
+                conversion_fail_err()
+                return None
+
+    # Changed 2020-06-25 as part of trying to add ignore_cache == 'if_null'
+    # support.
+    #else:
+    if cid is None:
         f2cid_fn_name = from_type + '2cid'
         if f2cid_fn_name not in globals():
             raise NotImplementedError(('define function {} to support ' +
@@ -1504,10 +1531,17 @@ def pubchem_url(cid):
 
 
 # TODO worth caching this too (w/ decorator)?
-def inchi2pubchem_url(inchi):
+def inchi2pubchem_url(inchi, **kwargs):
     if pd.isnull(inchi):
         return inchi
-    cid = convert(inchi, from_type='inchi', to_type='cid')
+    # TODO TODO TODO fix cause of this failing in input data
+    # (in natural_odors/literature_data.py inputs)
+    try:
+        cid = convert(inchi, from_type='inchi', to_type='cid', **kwargs)
+    except pcp.BadRequestError as e:
+        print(f'Error converting {inchi} to pubchem_url')
+        return None
+
     return pubchem_url(cid)
 
 
