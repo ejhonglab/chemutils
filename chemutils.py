@@ -3245,7 +3245,7 @@ def odor_inventory_gsheet(use_cache=False, verbose=False):
             (pkg_data_dir, os.getcwd())
         ]
         for p in paths_to_try:
-            if os.exists(p):
+            if exists(p):
                 link_filename = p
                 break
 
