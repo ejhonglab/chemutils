@@ -1542,6 +1542,12 @@ def inchi2pubchem_url(inchi, **kwargs):
         print(f'Error converting {inchi} to pubchem_url')
         return None
 
+    # TODO TODO TODO make this conditional on some input kwarg / fix cases
+    except ValueError as e:
+        warnings.warn(str(e))
+        return None
+    #
+
     return pubchem_url(cid)
 
 
@@ -3232,9 +3238,18 @@ def odor_inventory_gsheet(use_cache=False, verbose=False):
         with open(gsheet_cache_file, 'rb') as f:
             df = pickle.load(f)
     else:
-        with open(
-            join(pkg_data_dir, 'odor_inventory_sheet_link.txt'), 'r') as f:
+        # Falling back to os.getcwd() prefix as I don't have the data installed
+        # correctly with conda right now. Might want to allow setting via env
+        # var or something like that too.
+        paths_to_try = [join(d, 'odor_inventory_sheet_link.txt') for d in
+            (pkg_data_dir, os.getcwd())
+        ]
+        for p in paths_to_try:
+            if os.exists(p):
+                link_filename = p
+                break
 
+        with open(link_filename, 'r') as f:
             gsheet_url = \
                 f.readline().split('/edit')[0] + '/export?format=csv&gid='
 
