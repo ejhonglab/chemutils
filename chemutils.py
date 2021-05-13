@@ -29,6 +29,12 @@ from tokenize import TokenError
 
 pkg_data_dir = split(__file__)[0]
 
+# Can't use default xlrd now that it has dropped support for XLSX files, and although
+# pandas >= 1.2 might default to openpyxl if it's installed, it seems that some earlier
+# pandas versions (e.g. 1.1.5) may not. Note that writing still uses xlsxwriter, which
+# itself should be using openpyxl.
+pandas_excel_engine = 'openpyxl'
+
 # See notes in pint docs about concerns when pickling pint quantities or 
 # trying to use multiple unit registries...
 # (may want to just convert everything to some standard units, and return 
@@ -239,7 +245,7 @@ def load_manual_properties(to_update):
     if not exists(hardcoded_properties_xlsx):
         return
 
-    df = pd.read_excel(hardcoded_properties_xlsx)
+    df = pd.read_excel(hardcoded_properties_xlsx, engine=pandas_excel_engine)
     df.dropna(how='all', inplace=True)
 
     expected_cols = [
@@ -445,6 +451,7 @@ def add_hardcoded_overrides(_cache, overwrite_existing=True):
                 for hk, hv in hardcoded_f2t_dict.items():
                     if hk not in f2t_dict or isnull(f2t_dict[hk]):
                         # TODO delete
+                        '''
                         if first:
                             first = False
                             if hk not in f2t_dict:
@@ -454,6 +461,7 @@ def add_hardcoded_overrides(_cache, overwrite_existing=True):
                             print("_cache['" + "']['".join([ft, tt, hk]) + "']")
                             print('Hardcoding:', hk, hv)
                             import ipdb; ipdb.set_trace()
+                        '''
                         #
                         f2t_dict[hk] = hv
 
@@ -3088,11 +3096,11 @@ def load_or_save_excel_properties(df, excel_fname, name='', props=None,
 
         # TODO TODO automated checks that all things (non-nan) are either equal
         # or np.allclose (i checked manually and it's true)
-        #rt = pd.read_excel(excel_fname)
+        #rt = pd.read_excel(excel_fname, engine=pandas_excel_engine)
 
     else:
         print(f'Reading {name}property data from', excel_fname)
-        df = pd.read_excel(excel_fname)
+        df = pd.read_excel(excel_fname, engine=pandas_excel_engine)
         add_properties_to_cache(df, verbose=verbose)
 
     return df
@@ -3223,8 +3231,8 @@ def add_properties_to_cache(df, overwrite_close=False, dropna=True,
 
 _odor_inventory_gsheet = None
 def odor_inventory_gsheet(use_cache=False, verbose=False):
-    '''Returns a DataFrame with data odor inventory data from Google sheet.
-    '''
+    """Returns a DataFrame with data odor inventory data from Google sheet.
+    """
     global _odor_inventory_gsheet
     if _odor_inventory_gsheet is not None:
         return _odor_inventory_gsheet
@@ -3241,13 +3249,19 @@ def odor_inventory_gsheet(use_cache=False, verbose=False):
         # Falling back to os.getcwd() prefix as I don't have the data installed
         # correctly with conda right now. Might want to allow setting via env
         # var or something like that too.
-        paths_to_try = [join(d, 'odor_inventory_sheet_link.txt') for d in
-            (pkg_data_dir, os.getcwd())
-        ]
+        odor_inventory_link_fname = 'odor_inventory_sheet_link.txt'
+        dirs_to_try = (os.getcwd(), pkg_data_dir)
+        paths_to_try = [join(d, odor_inventory_link_fname) for d in dirs_to_try]
+        link_filename = None
         for p in paths_to_try:
             if exists(p):
                 link_filename = p
                 break
+
+        if link_filename is None:
+            raise IOError(f'{odor_inventory_link_fname} not found in any of '
+                f'{dirs_to_try}'
+            )
 
         with open(link_filename, 'r') as f:
             gsheet_url = \
