@@ -50,10 +50,10 @@ ureg = pint.UnitRegistry()
 # not exactly sure what this does...
 pint.set_application_registry(ureg)
 
-cache_file = os.path.expanduser('~/.chemutils_cache.p')
+cache_file = os.path.expanduser(join('~', '.chemutils_cache.p'))
 
 chemspipy_api_key = None
-chemspipy_api_key_file = os.path.expanduser('~/.chemspipy_api_key')
+chemspipy_api_key_file = os.path.expanduser(join('~', '.chemspipy_api_key'))
 if exists(chemspipy_api_key_file):
     with open(chemspipy_api_key_file, 'r') as f:
         chemspipy_api_key = f.read().strip()
@@ -1903,7 +1903,7 @@ def cid2molar_mass(cid):
     units = 'g/mol'
 
     return pd.Series({
-        'molar_mass': compound.molecular_weight,
+        'molar_mass': float(compound.molecular_weight),
         'molar_mass_sources': url,
         'molar_mass_units': 'g/mol'
     })
