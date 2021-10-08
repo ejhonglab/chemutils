@@ -6,10 +6,8 @@ we may want to do with the chemical components of odor mixtures.
 
 ### Installation
 ```
-pip install --user git+https://github.com/ejhonglab/chemutils.git
+pip install git+https://github.com/ejhonglab/chemutils
 ```
-Replace `pip` with `pip3` if you are on a computer with both Python 2 and 3, and
-you want to use this with Python 3.
 
 Functions using `pubchemprops` (anything calling `cu.pubchemprops_lookup`) will require
 that you have a copy of [my fork](https://github.com/tom-f-oconnell/pubchemprops) of
