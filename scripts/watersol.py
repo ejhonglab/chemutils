@@ -41,7 +41,7 @@ def ul_soluble_in_ml_water(ml_water, water_solubility, density=None,
     # (mass/vol) / (mass/vol) => dimensionless
     assert vv_water_sol.dimensionless
 
-    water_vol = ml_water * ureg['mL']
+    water_vol = ml_water * ureg('mL')
     return (water_vol * vv_water_sol).to('uL').m
 
 

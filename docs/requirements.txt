@@ -1,1 +1,4 @@
 sphinx==3.3.1
+# https://github.com/readthedocs/readthedocs.org/issues/9038
+# could not be an issue w/ newer sphinx, but gonna keep pinning for now
+jinja2<3.1
