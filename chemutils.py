@@ -1494,7 +1494,7 @@ def convert(chem_id, from_type=None, to_type='inchi', verbose=False,
         cid = cache[from_type]['cid'][old_chem_id]
         if verbose:
             print('falling back to non-normalized chem_id')
-            print(f'{old_chem_id} of type {from_type} had CID {cid} in cache'
+            print(f'{old_chem_id} of type {from_type} had CID {cid} in cache')
 
         if cid is None:
             # TODO could probably handle this once below in `if cid is None`
