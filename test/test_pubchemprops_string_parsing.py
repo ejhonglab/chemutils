@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# NOTE: currently ignored via ../pytest.ini
 
 """
 Using some data from lookups on strawberry mean sample

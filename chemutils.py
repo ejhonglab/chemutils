@@ -982,19 +982,31 @@ def inchi_layer_set(inchis):
     return inchis.apply(lambda x: set(inchi_layers(x))).agg(union)
 
 
-# TODO unit test this
-# TODO TODO add flag explicitly controlling behavior of null values. i think now,
-# because of null-dropping behavior of some of the pandas fns, null is likely to get
-# ignored.
-def is_one2one(df, col1, col2):
-    # TODO TODO maybe modify this to print violations of 1:1-ness, when there
-    # are any (otherwise write another fn for this)
+# TODO move to / dupe to hong2p? (along w/ unit test i now have for this)
+def is_one2one(df: pd.DataFrame, x: str, y: str, *, dropna: bool = True) -> bool:
+    """Returns True if x and y are 1:1 with each other in df.
 
-    # from answer by zipa @ stackoverflow.com/questions/50643386
-    # might be a faster way to do this...
-    first = df.drop_duplicates([col1, col2]).groupby(col1)[col2].count().max()
-    second = df.drop_duplicates([col1, col2]).groupby(col2)[col1].count().max()
-    return first + second == 2
+    Handling of null still broken.
+    """
+    # TODO maybe modify this to print violations of 1:1-ness, when there are any
+    # (otherwise write another fn for this)?
+
+    unique_combos = df[[x, y]].drop_duplicates()
+
+    # needed this *in addition to* passing dropna to groupby and dropna
+    if dropna:
+        unique_combos = unique_combos.dropna()
+
+    # https://stackoverflow.com/questions/50643386
+    ny_for_each_x = unique_combos.groupby(x, dropna=dropna)[y].nunique(dropna=dropna)
+    if (ny_for_each_x != 1).any():
+        return False
+
+    nx_for_each_y = unique_combos.groupby(y, dropna=dropna)[x].nunique(dropna=dropna)
+    if (nx_for_each_y != 1).any():
+        return False
+
+    return True
 
 
 def print_full_df(df, index=False):
@@ -1013,8 +1025,7 @@ def inchi_diff_in_details(df):
     # TODO also count name/cas/(name,cas) here, as w/ inchi_counts?
     ncdf = df.drop_duplicates(subset=cols_to_show)
 
-    # TODO replace w/ f-string
-    print_header = 'InChI with multiple combinations of {}:'.format(other_keys)
+    print_header = f'InChI with multiple combinations of {other_keys}:'
     printed = False
     for gn, gdf in ncdf.groupby('inchi'):
         if len(gdf) <= 1:
@@ -1077,11 +1088,11 @@ def count_inchi_layers(inchis):
     return counts
 
 
-def convertable(chem_id_type):
+# TODO rename to is_chem_id[_var] or something?
+def convertable(chem_id_type: str) -> bool:
     """Returns whether the string input is recognized as a convertable type.
 
-    (valid for the `to_type` and `from_type` arguments to the `convert`
-    function)
+    (valid for the `to_type` and `from_type` arguments to the `convert` function)
     """
     if chem_id_type in chem_id_types or chem_id_type in equivalent_col_names:
         return True
@@ -1103,7 +1114,7 @@ cid2compound_cache = dict()
 # object) ('orig_*')
 # TODO add kwarg flag to enable checks that output id is 1:1 w/ input ids
 # (unless theres already some reason to expect this to be true?)
-# TODO TODO TODO try to refactor use of cache across here+cached decorator to share the
+# TODO TODO try to refactor use of cache across here+cached decorator to share the
 # same logic (+ to share logic for having a non-persistent (within run) cache, that is
 # used no matter what
 #
@@ -1119,14 +1130,11 @@ def convert(chem_id, from_type=None, to_type='inchi', verbose=False,
     """
     allow_nan (bool): whether to err if any lookups fail
     """
-
     def conversion_fail_errmsg():
-        # TODO replace w/ f-string
-        return 'Conversion from {} to {} failed for'.format(from_type, to_type)
+        return f'conversion from {from_type} to {to_type} failed for'
 
     def conversion_fail_err():
-        # TODO replace w/ f-string
-        msg = conversion_fail_errmsg() + ' {}'.format(chem_id)
+        msg = conversion_fail_errmsg() + f' {chem_id}'
         if not allow_nan:
             # TODO delete
             print()
@@ -1308,9 +1316,7 @@ def convert(chem_id, from_type=None, to_type='inchi', verbose=False,
                         norm_fn_name = 'normalize_' + ft
                         if norm_fn_name in globals():
                             if verbose:
-                                # TODO replace w/ f-string
-                                print('Applying {} to input column'.format(
-                                    norm_fn_name))
+                                print(f'applying {norm_fn_name} to input column')
 
                             # TODO still print same kind of verbose stuff as
                             # other normalization section does (refactor?)
@@ -1324,9 +1330,11 @@ def convert(chem_id, from_type=None, to_type='inchi', verbose=False,
                 missing = attempts.isnull().all(axis=1)
                 if missing.any():
                     cols = orig_cols_added + list(attempts.columns)
-                    # TODO replace w/ f-string
-                    err_str = 'Conversion from {} to {} failed for:\n'.format(
-                        [c for c in cols], to_type
+                    # TODO why not using conversion_fail_err[msg] (presumably b/c that
+                    # seems set up for single chem_ids, not Series of them? update?)?
+                    # delete one or the other? refactor?
+                    err_str = (f'conversion from {[c for c in cols]} to {to_type} '
+                        'failed for:\n'
                     )
                     missing = df[missing].drop_duplicates(
                         subset=cols).dropna(subset=cols, how='all')[cols]
@@ -1374,7 +1382,7 @@ def convert(chem_id, from_type=None, to_type='inchi', verbose=False,
                 if conflicts.any():
                     if not allow_conflicts or report_conflicts:
                         # TODO make sure only unique conflicts are printed
-                        print('Conflicting lookup results:')
+                        print('conflicting lookup results:')
                         for i, conflict in attempts[conflicts].iterrows():
                             conflict = conflict.dropna()
                             inputs = df.loc[i, conflict.keys()]
@@ -1405,10 +1413,7 @@ def convert(chem_id, from_type=None, to_type='inchi', verbose=False,
         from_type = equivalent_col_names[from_type]
 
     if verbose:
-        # TODO replace w/ f-string
-        print('Trying to convert {} from {} to {}'.format(
-            chem_id, from_type, to_type
-        ))
+        print(f'trying to convert {chem_id} from {from_type} to {to_type}')
 
     # To short-circuit normalization in the more-common case where null exists
     # before normalization.
@@ -1425,8 +1430,7 @@ def convert(chem_id, from_type=None, to_type='inchi', verbose=False,
         if norm_fn_name in globals():
             chem_id = globals()[norm_fn_name](chem_id)
             if verbose and old_chem_id != chem_id:
-                # TODO replace w/ f-string
-                print('{}({}) -> {}'.format(norm_fn_name, old_chem_id, chem_id))
+                print(f'{norm_fn_name}({old_chem_id}) -> {chem_id}')
 
     # Since sometimes (just normalize_cas, for now) normalize fns can return
     # null.
@@ -1448,8 +1452,7 @@ def convert(chem_id, from_type=None, to_type='inchi', verbose=False,
             # TODO need other handling of ignore_cache == False case?
             if not (ignore_cache == 'if_null' and pd.isnull(val)):
                 if verbose:
-                    # TODO replace w/ f-string
-                    print('Returning {} from cache'.format(val))
+                    print(f'returning {val} from cache')
                 return val
 
         elif try_non_normalized and old_chem_id in cache[from_type][to_type]:
@@ -1459,8 +1462,8 @@ def convert(chem_id, from_type=None, to_type='inchi', verbose=False,
                 if verbose:
                     # TODO here and in other similar places, replace
                     # 'chem_id' w/ value of `from_type`
-                    print('Falling back to non-normalized chem_id')
-                    print('Returning {} from cache'.format(val))
+                    print('falling back to non-normalized chem_id')
+                    print(f'returning {val} from cache')
                 return val
 
     # Added 2020-06-25 as part of trying to add ignore_cache == 'if_null'
@@ -1473,22 +1476,10 @@ def convert(chem_id, from_type=None, to_type='inchi', verbose=False,
 
     #if not ignore_cache and chem_id in cache[from_type]['cid']:
     if ignore_cache != True and chem_id in cache[from_type]['cid']:
-        # TODO delete
-        print('CASE 1')
-        #
-
-        # TODO TODO TODO would this actually be producing CIDs?
-        # it's not producing values of whatever format chem_id is?
-        # check!!!
         cid = cache[from_type]['cid'][chem_id]
-        # TODO delete (after checking as comment above calls for)
-        import ipdb; ipdb.set_trace()
-        #
         if verbose:
-            # TODO replace w/ f-string
-            print('{} of type {} had CID {} in cache'.format(chem_id, from_type,
-                cid
-            ))
+            print(f'{chem_id} of type {from_type} had CID {cid} in cache')
+
         if cid is None:
             if ignore_cache != 'if_null':
                 if verbose:
@@ -1500,16 +1491,10 @@ def convert(chem_id, from_type=None, to_type='inchi', verbose=False,
     elif (ignore_cache != True and try_non_normalized and
         old_chem_id in cache[from_type]['cid']):
 
-        # TODO delete
-        print('CASE 2')
-        #
         cid = cache[from_type]['cid'][old_chem_id]
         if verbose:
-            print('Falling back to non-normalized chem_id')
-            # TODO replace w/ f-string
-            print('{} of type {} had CID {} in cache'.format(old_chem_id,
-                from_type, cid
-            ))
+            print('falling back to non-normalized chem_id')
+            print(f'{old_chem_id} of type {from_type} had CID {cid} in cache'
 
         if cid is None:
             # TODO could probably handle this once below in `if cid is None`
@@ -1526,35 +1511,31 @@ def convert(chem_id, from_type=None, to_type='inchi', verbose=False,
     if cid is None:
         f2cid_fn_name = from_type + '2cid'
 
-        # TODO replace .format(...) w/ f-strings
-
         if f2cid_fn_name not in globals():
             # TODO delete. why is this failing in cid->name case
             import ipdb; ipdb.set_trace()
             #
-            raise NotImplementedError(('define function {} to support ' +
-                'conversion from type {}').format(f2cid_fn_name, from_type)
+            raise NotImplementedError(f'define function {f2cid_fn_name} to support '
+                f'conversion from type {from_type}'
             )
 
         if verbose:
-            print('Calling CID lookup function', f2cid_fn_name)
+            print('calling CID lookup function', f2cid_fn_name)
 
         cid = globals()[f2cid_fn_name](chem_id)
 
         if cid is None:
             if verbose:
-                print('Looking up CID for {} of type {} failed!'.format(
-                    chem_id, from_type))
+                print(f'looking up CID for {chem_id} of type {from_type} failed!')
 
             if try_non_normalized:
                 if verbose:
-                    print('Falling back to non-normalized chem_id')
+                    print('falling back to non-normalized chem_id')
                 cid = globals()[f2cid_fn_name](old_chem_id)
 
         if cid is None:
             if try_non_normalized and verbose:
-                print('Looking up CID for {} of type {} failed!'.format(
-                    old_chem_id, from_type))
+                print(f'looking up CID for {old_chem_id} of type {from_type} failed!')
 
             for tt in chem_id_types:
                 to_type_cache = cache[from_type][tt]
@@ -1566,8 +1547,7 @@ def convert(chem_id, from_type=None, to_type='inchi', verbose=False,
             return None
 
         if verbose:
-            # TODO replace w/ f-string
-            print('CID={}'.format(cid))
+            print(f'CID={cid}')
 
         cache[from_type]['cid'][chem_id] = cid
 
@@ -1597,7 +1577,6 @@ def convert(chem_id, from_type=None, to_type='inchi', verbose=False,
         #
 
         # TODO delete
-        import time
         t0 = time.time()
         #
 
@@ -1617,8 +1596,7 @@ def convert(chem_id, from_type=None, to_type='inchi', verbose=False,
     if compound is None:
         # TODO should i just assert false here or something?
         if verbose:
-            # TODO replace w/ f-string
-            print('Creating Compound from CID {} failed!'.format(cid))
+            print(f'creating Compound from CID {cid} failed!')
 
         for tt in chem_id_types:
             # TODO if we didn't need this though, we could factor this into a fn
@@ -1634,16 +1612,14 @@ def convert(chem_id, from_type=None, to_type='inchi', verbose=False,
         conversion_fail_err()
         return None
 
-    # TODO replace w/ f-strings
-
     compound2t_fn_name = 'compound2' + to_type
     if compound2t_fn_name not in globals():
-        raise NotImplementedError(('define function {} to support ' +
-            'conversion to type {}').format(compound2t_fn_name, to_type))
+        raise NotImplementedError(f'define function {compound2t_fn_name} to support '
+            f'conversion to type {to_type}'
+        )
 
     if verbose:
-        print('Calling function {} to get {} from Compound'.format(
-            compound2t_fn_name, to_type))
+        print(f'calling function {compound2t_fn_name} to get {to_type} from Compound')
 
     # TODO delete
     global gt0
@@ -1660,8 +1636,7 @@ def convert(chem_id, from_type=None, to_type='inchi', verbose=False,
     cache[from_type][to_type][chem_id] = to_type_val
 
     if verbose and to_type_val is None:
-        print('Conversion of {} from Compound to {} failed!'.format(
-            chem_id, to_type))
+        print(f'conversion of {chem_id} from Compound to {to_type} failed!')
         conversion_fail_err()
 
     return to_type_val
@@ -1760,15 +1735,9 @@ def normalize_name(name):
     )
     for i, c in indicator2correction:
         if i(normed_name):
-            # TODO replace w/ f-strings
-
-            print('Indicator {} was True for {}'.format(
-                i.__name__, normed_name))
-
+            print(f'indicator {i.__name__} was True for {normed_name}')
             normed_name = c(normed_name)
-
-            print('Applying correction {} to get {}.'.format(
-                c.__name__, normed_name))
+            print(f'applying correction {c.__name__} to get {normed_name}.')
 
     return normed_name
 
@@ -1790,10 +1759,11 @@ def normalize_cas(cas):
 
 
 def pubchem_url(cid):
+    # TODO return None always and use Optional[str] for return type hint?
     if pd.isnull(cid):
         return cid
-    # TODO replace w/ f-string
-    return 'https://pubchem.ncbi.nlm.nih.gov/compound/{}'.format(cid)
+    # .0f to work w/ floats (e.g. from a Series that is a mix of ints and NaN)
+    return f'https://pubchem.ncbi.nlm.nih.gov/compound/{cid:.0f}'
 
 
 # TODO worth caching this too (w/ decorator)?
@@ -1849,14 +1819,12 @@ def name2cid(name, verbose=False):
         # TODO TODO TODO focus on cases where there are multiple
         # fewest-InChI-layer-results, and figure out whether / what
         # other strategies are necessary to resolve results
-        # TODO replace w/ f-strings
-        print('Got multiple results from name={}:'.format(name))
+        print(f'got multiple results from name={name}:')
         n_inchi_parts = [len(r.inchi.split('/')) for r in results]
         fewest_inchi_parts = sorted(n_inchi_parts)[0]
         counts = Counter(n_inchi_parts)
-        print('Fewest InChI parts: {}'.format(fewest_inchi_parts))
-        print('# InChIs w/ that many parts: {}'.format(
-            counts[fewest_inchi_parts]))
+        print(f'fewest InChI parts: {fewest_inchi_parts}')
+        print(f'# InChIs w/ that many parts: {counts[fewest_inchi_parts]}')
         print(counts)
         for r in results:
             print(r.inchi)
@@ -1898,14 +1866,12 @@ def cas2cid(cas, verbose=False):
         # TODO TODO TODO focus on cases where there are multiple
         # fewest-InChI-layer-results, and figure out whether / what
         # other strategies are necessary to resolve results
-        # TODO replace w/ f-strings
-        print('Got multiple results from CAS={}'.format(cas))
+        print(f'got multiple results from CAS={cas}')
         n_inchi_parts = [len(r.inchi.split('/')) for r in results]
         fewest_inchi_parts = sorted(n_inchi_parts)[0]
         counts = Counter(n_inchi_parts)
-        print('Fewest InChI parts: {}'.format(fewest_inchi_parts))
-        print('# InChIs w/ that many parts: {}'.format(
-            counts[fewest_inchi_parts]))
+        print(f'fewest InChI parts: {fewest_inchi_parts}')
+        print(f'# InChIs w/ that many parts: {counts[fewest_inchi_parts]}')
         print(counts)
         for r in results:
             print(r.inchi)
@@ -1977,8 +1943,7 @@ def compound2cas(compound, verbose=False):
 
     if len(cas_number_candidates) == 0:
         if verbose:
-            # TODO replace w/ f-string
-            print('No CAS numbers found online for {}'.format(cas))
+            print(f'no CAS numbers found online for {cas}')
         cas_num = None
     else:
         cas_num = sorted(cas_number_candidates)[0]
@@ -1989,14 +1954,13 @@ def compound2smiles(compound):
     return compound.canonical_smiles
 
 
+# TODO doc (/ better name). what is this for (only used in natural_odors/odors.py)?
 def fmt_id_type(chem_id_type):
     if chem_id_type in equivalent_col_names:
         chem_id_type = equivalent_col_names[chem_id_type]
 
     if chem_id_type not in chem_id_types:
-        # TODO replace w/ f-string
-        raise KeyError('unrecognized chem_id type. options are: {}'.format(
-            chem_id_types))
+        raise KeyError(f'unrecognized chem_id type. options are: {chem_id_types}')
 
     fmt_dict = {
         'cas': 'CAS',
@@ -4010,9 +3974,7 @@ def odor_inventory_gsheet(use_cache=False, verbose=False):
 
     gsheet_cache_file = '.odor_inventory_gsheet_cache.p'
     if use_cache and exists(gsheet_cache_file):
-        # TODO replace w/ f-string
-        print('Loading odor inventory sheet data from cache at {}'.format(
-            gsheet_cache_file))
+        print(f'loading odor inventory sheet data from cache at {gsheet_cache_file}')
         # TODO use pandas interface (if not factoring out whole gsheet reading
         # thing)
         with open(gsheet_cache_file, 'rb') as f:
@@ -4150,8 +4112,7 @@ def odor2abbrev(odor_name, *args, allow_orphan_abbrevs=False,
 
     inchi = convert(odor_name, from_type='name', verbose=verbose)
     if pd.isnull(inchi):
-        # TODO replace w/ f-string
-        print('could not find inchi for odor {}!'.format(odor_name))
+        print(f'could not find inchi for odor {odor_name}!')
         return inchi
 
     if pd.isnull(inchi):
