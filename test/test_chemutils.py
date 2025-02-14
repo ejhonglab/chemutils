@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 
 import pandas as pd
+import pubchempy as pcp
 
-from chemutils import is_one2one
+from chemutils import is_one2one, compound2cas, allowed_kwarg
+import chemutils as cu
 
 
 def _is_one2one(xs, ys, **kwargs):
@@ -37,4 +39,46 @@ def test_is_one2one_with_null():
         assert dropna == _is_one2one(xs1, ys1, dropna=dropna)
         assert dropna == _is_one2one(xs2, ys2, dropna=dropna)
 
+
+def test_compound2cas():
+    # alpha-pinene
+    # https://pubchem.ncbi.nlm.nih.gov/compound/6654
+    cid = 6654
+    compound = pcp.Compound.from_cid(cid)
+    # first one i can see under "Synonyms" section on page above is "80-56-8", and this
+    # one also seems to list the greatest number of sources under "Other Identifiers" >
+    # "CAS" section, though there are also:
+    # - 25766-18-1 (CAS Common Chemistry; ChemIDplus)
+    # - 2437-95-8 (ECHA)
+    # - 7785-70-8 (EPA)
+    cas = compound2cas(compound)
+    assert cas == '80-56-8'
+
+
+def test_allowed_kwarg():
+    # compound2cas DOES have a verbose=True kwarg (specified as keyword only, via
+    # preceding `*, ` in def
+    assert allowed_kwarg(compound2cas, 'verbose')
+
+    # compound2name takes no arguments other than a single required positional arg
+    assert not allowed_kwarg(cu.compound2name, 'verbose')
+
+    def f1(x, verbose=True):
+        return x
+
+    def f2(x, **kwargs):
+        return x
+
+    # despite this being as positional argument, can still pass as f3(verbose=True)
+    def f3(verbose):
+        pass
+
+    # here verbose is positional only, so can not specify it as kwarg
+    def f4(verbose, /):
+        pass
+
+    assert allowed_kwarg(f1, 'verbose')
+    assert allowed_kwarg(f2, 'verbose')
+    assert allowed_kwarg(f3, 'verbose')
+    assert not allowed_kwarg(f4, 'verbose')
 

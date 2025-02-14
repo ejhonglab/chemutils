@@ -19,11 +19,13 @@ import pickle
 from pprint import pformat
 import re
 import time
+from typing import Optional, Callable
 import traceback
 import urllib.error
 
 import numpy as np
 import pubchempy as pcp
+from pubchempy import Compound
 import pandas as pd
 # TODO maybe also install and use the pandas support module for this.
 # may need to do conversion of whole pandas objects in here than, rather
@@ -779,38 +781,28 @@ for prop, preferred_unit_str in property2preferred_units.items():
 atexit.register(save_cache)
 
 
-# TODO maybe cache the result of this fn? when most values are cached,
-# this might constitute a big relative portion of lookup time...
-# TODO unit test that shows whether getfullargspec works on stuff w/ kwonly arguments,
-# or whether we need to change handling of its outputs
-def allowed_kwarg(fn, kwarg_name):
+def allowed_kwarg(fn: Callable, kwarg_name: str) -> bool:
     """Returns whether `kwarg_name` can be passed as a keyword argument to `fn`.
     """
-    args, varargs, varkw, defaults, kwonlyargs, _, _ = inspect.getfullargspec(fn)
+    args, varargs, varkw, defaults, kwonlyargs, kwonlydefaults, annotations = \
+        inspect.getfullargspec(fn)
 
-    # TODO delete. remove usage of getargspec. causes deprecation issue when calling
-    # with PYTHONWARNINGS=error.
-    try:
-        args2, varargs2, varkw2, defaults2 = inspect.getargspec(fn)
-        assert args == args2
-        assert varargs == varargs2
-        assert varkw == varkw2
-        assert defaults == defaults2
-        #print()
-        #print(f'(getfullargspec only) {kwonlyargs=}')
+    # https://stackoverflow.com/questions/71106783
+    signature = inspect.signature(fn)
+    positional_only_args = [
+        x.name for x in signature.parameters.values() if x.kind == x.POSITIONAL_ONLY
+    ]
 
-    # literally just so i can still use `python -W error make_csv.py` when trying to
-    # figure out where the pint WARNING is coming from (that is probably not a proper
-    # warning anyway...)
-    except DeprecationWarning:
-        pass
-    #
-
+    # if fn takes **kwargs, it can take any keyword argument (unless maybe also
+    # specified as positional only? don't think i care about that case)
     if varkw is not None:
         return True
 
     # I guess something doesn't need a default to be passable as a kwarg...
-    return kwarg_name in args
+    return (
+        (kwarg_name in args and kwarg_name not in positional_only_args)
+        or kwarg_name in kwonlyargs
+    )
 
 
 _nonpersistent_cache = dict()
@@ -1117,33 +1109,32 @@ cid2compound_cache = dict()
 # TODO TODO try to refactor use of cache across here+cached decorator to share the
 # same logic (+ to share logic for having a non-persistent (within run) cache, that is
 # used no matter what
-#
-# TODO delete
-gt0 = None
-#
-#@profile
-def convert(chem_id, from_type=None, to_type='inchi', verbose=False,
-    allow_nan=False, allow_conflicts=True, ignore_cache=False, exclude_cols=[],
-    already_normalized=False, drop_na=True, report_missing=True,
-    report_conflicts=True, try_non_normalized=True, check_one2one=False,
-    keep_originals=False, orig_prefix='orig_'):
+def convert(chem_id, from_type=None, to_type='inchi', *, verbose: bool = False,
+    allow_nan: bool = False, allow_conflicts: bool = True, ignore_cache: bool = False,
+    exclude_cols=tuple(), already_normalized: bool = False, dropna: bool = True,
+    report_missing: bool = True, report_conflicts: bool = True,
+    try_non_normalized: bool = True, check_one2one: bool = False,
+    keep_originals: bool = False, orig_prefix: str = 'orig_'):
     """
-    allow_nan (bool): whether to err if any lookups fail
+    Args:
+        dropna: whether to drop input subset where lookups fail (if setting this to
+            False, probably want `allow_nan=True`)
+
+        allow_nan: whether to err if any lookups fail (does not depend on
+            `dropna=False`)
     """
     def conversion_fail_errmsg():
         return f'conversion from {from_type} to {to_type} failed for'
 
     def conversion_fail_err():
         msg = conversion_fail_errmsg() + f' {chem_id}'
+
         if not allow_nan:
-            # TODO delete
-            print()
-            print(msg)
-            import ipdb; ipdb.set_trace()
-            #
             raise ValueError(msg)
+
         elif report_missing:
             print(msg)
+
 
     if check_one2one:
         raise NotImplementedError
@@ -1229,7 +1220,7 @@ def convert(chem_id, from_type=None, to_type='inchi', verbose=False,
                     print(err_str)
             del missing
 
-            if drop_na:
+            if dropna:
                 converted = converted.dropna()
 
             return converted
@@ -1260,7 +1251,7 @@ def convert(chem_id, from_type=None, to_type='inchi', verbose=False,
                 'to_type': to_type,
                 'allow_nan': allow_nan,
                 'ignore_cache': ignore_cache,
-                'drop_na': drop_na,
+                'dropna': dropna,
                 'already_normalized': already_normalized,
                 'report_missing': report_missing,
                 'verbose': verbose
@@ -1271,7 +1262,11 @@ def convert(chem_id, from_type=None, to_type='inchi', verbose=False,
                     # TODO probably factor our this orig col handling logic to
                     # a nested fn
                     orig_col = orig_prefix + df.index.name
+
+                    # TODO TODO replace w/ asserting it's either not there OR equal to
+                    # the column already there
                     assert orig_col not in df.columns
+
                     orig_cols_added.append(orig_col)
                     df[orig_col] = df.index.copy()
 
@@ -1281,7 +1276,11 @@ def convert(chem_id, from_type=None, to_type='inchi', verbose=False,
             if convertable(df.columns.name):
                 if keep_originals:
                     orig_col = orig_prefix + df.columns.name
+
+                    # TODO TODO replace w/ asserting it's either not there OR equal to
+                    # the column already there
                     assert orig_col not in df.columns
+
                     orig_cols_added.append(orig_col)
                     df[orig_col] = df.columns.copy()
 
@@ -1290,7 +1289,7 @@ def convert(chem_id, from_type=None, to_type='inchi', verbose=False,
 
             if not converted_an_index:
                 kwargs['allow_nan'] = True
-                kwargs['drop_na'] = False
+                kwargs['dropna'] = False
                 kwargs['already_normalized'] = True
                 kwargs['report_missing'] = False
 
@@ -1306,7 +1305,11 @@ def convert(chem_id, from_type=None, to_type='inchi', verbose=False,
 
                         if keep_originals:
                             orig_col = orig_prefix + c
+
+                            # TODO TODO replace w/ asserting it's either not there OR
+                            # equal to the column already there
                             assert orig_col not in df.columns
+
                             orig_cols_added.append(orig_col)
                             df[orig_col] = df[c].copy()
 
@@ -1336,8 +1339,8 @@ def convert(chem_id, from_type=None, to_type='inchi', verbose=False,
                     err_str = (f'conversion from {[c for c in cols]} to {to_type} '
                         'failed for:\n'
                     )
-                    missing = df[missing].drop_duplicates(
-                        subset=cols).dropna(subset=cols, how='all')[cols]
+                    missing = df[missing].drop_duplicates(subset=cols).dropna(
+                        subset=cols, how='all')[cols]
 
                     with pd.option_context('display.max_colwidth', -1):
                         err_str += missing.to_string()
@@ -1349,14 +1352,17 @@ def convert(chem_id, from_type=None, to_type='inchi', verbose=False,
                 del missing
 
                 input_priorities = {k: p for p, k in enumerate(chem_id_types)}
+
                 def priority(id_type):
                     if id_type in equivalent_col_names:
                         id_type = equivalent_col_names[id_type]
+
                     return input_priorities[id_type]
 
                 cols_in_order = sorted(attempts.columns, key=priority)
-                values = attempts[cols_in_order].apply(
-                    lambda x: x.dropna().unique(), axis=1)
+                values = attempts[cols_in_order].apply(lambda x: x.dropna().unique(),
+                    axis=1
+                )
                 # TODO use that str len fn?
                 conflicts = values.apply(lambda x: len(x) > 1)
 
@@ -1376,7 +1382,7 @@ def convert(chem_id, from_type=None, to_type='inchi', verbose=False,
                 df[to_type] = values.apply(
                     lambda x: None if len(x) == 0 else x[0]
                 )
-                if drop_na:
+                if dropna:
                     df.dropna(subset=[to_type], inplace=True)
 
                 if conflicts.any():
@@ -1621,17 +1627,12 @@ def convert(chem_id, from_type=None, to_type='inchi', verbose=False,
     if verbose:
         print(f'calling function {compound2t_fn_name} to get {to_type} from Compound')
 
-    # TODO delete
-    global gt0
-    if gt0 is not None:
-        s2 = time.time() - gt0
-        print(f'everything else took {s2:.3f}s')
-    #
-    to_type_val = globals()[compound2t_fn_name](compound)
+    compound2t_fn = globals()[compound2t_fn_name]
 
-    # TODO delete
-    gt0 = time.time()
-    #
+    if allowed_kwarg(compound2t_fn, 'verbose'):
+        to_type_val = compound2t_fn(compound, verbose=verbose)
+    else:
+        to_type_val = compound2t_fn(compound)
 
     cache[from_type][to_type][chem_id] = to_type_val
 
@@ -1750,20 +1751,36 @@ def normalize_cas(cas):
     if pd.isnull(cas):
         return cas
 
+    # TODO include comment saying which kind of inputs this is meant to process
+    # (i think it was some libraries that had unnecessary quotes in their CAS values?)
     normed_cas = ''.join(cas.replace('"','').split())
+
     # TODO library seems to return 0-00-0 sometimes... but this is incorrect,
     # right? replace w/ NaN?
     if normed_cas == '0-00-0':
         return None
+
     return normed_cas
 
 
-def pubchem_url(cid):
-    # TODO return None always and use Optional[str] for return type hint?
+pubchem_root_url = 'https://pubchem.ncbi.nlm.nih.gov'
+def pubchem_url(cid: int) -> Optional[str]:
+    # TODO return None always (would prob make Optional[str] type hint more accurate,
+    # but could break some stuff...)?
     if pd.isnull(cid):
         return cid
+
     # .0f to work w/ floats (e.g. from a Series that is a mix of ints and NaN)
-    return f'https://pubchem.ncbi.nlm.nih.gov/compound/{cid:.0f}'
+    return f'{pubchem_root_url}/compound/{cid:.0f}'
+
+
+# TODO any params i could add to make it only search compounds?
+# maybe '&selected_id_type=cid'? unclear that helped in browser tho
+# TODO or &tab=compound maybe?
+def pubchem_search_url(text: str) -> str:
+    # TODO need to do any encoding of text? 'β' seems to show up in url in browser
+    # as-is, so maybe not (or at least not for these chars)?
+    return f'{pubchem_root_url}/#query={text}'
 
 
 # TODO worth caching this too (w/ decorator)?
@@ -1902,7 +1919,7 @@ def inchi2cid(inchi, verbose=False):
     return results[0].cid
 
 
-def compound2cid(compound):
+def compound2cid(compound: Compound) -> int:
     return compound.cid
 
 
@@ -1910,12 +1927,12 @@ def compound2cid(compound):
 # of getting this. most of the time this would probably be preferable to IUPAC
 # name (as long as it doesn't depend on how the page is accessed...).
 # e.g. 'linalool' vs IUPAC '3,7-dimethylocta-1,6-dien-3-ol'
-def compound2name(compound):
+def compound2name(compound: Compound) -> str:
     # TODO use name displayed on pubchem page (accessible thru pubchempy?)?
     return compound.iupac_name
 
 
-def compound2inchi(compound):
+def compound2inchi(compound: Compound) -> str:
     inchi = compound.inchi
     # TODO sometimes, is it just the prefix?
     assert inchi.startswith('InChI=')
@@ -1925,29 +1942,36 @@ def compound2inchi(compound):
     return inchi
 
 
-def compound2inchikey(compound):
+def compound2inchikey(compound: Compound) -> str:
     return compound.inchikey
 
 
-def compound2cas(compound, verbose=False):
-    # TODO TODO how to start w/ a compound and get CAS?
-    r = results[0]
-    cas_number_candidates = []
-    for syn in r.get('Synonym', []):
-        # TODO TODO TODO behavior hasn't changed by switching this to a raw string
-        # (just unit test this if i wanna keep it around...)
-        match = re.match(r'(\d{2,7}-\d\d-\d)', syn)
-        if match:
-            cas_number_candidates.append(match.group(1))
-        # TODO so not every entry in pubchem has an associated CAS?
-
-    if len(cas_number_candidates) == 0:
+def compound2cas(compound: Compound, *, verbose: bool = False) -> Optional[str]:
+    cas_numbers = [
+        x for x in compound.synonyms if re.match(r'(\d{2,7}-\d\d-\d)', x)
+    ]
+    cid = compound.cid
+    if len(cas_numbers) == 0:
         if verbose:
-            print(f'no CAS numbers found online for {cas}')
-        cas_num = None
+            print(f'no CAS numbers found in PubChem for {cid=}')
+            print(pubchem_url(cid))
+
+        cas = None
     else:
-        cas_num = sorted(cas_number_candidates)[0]
-    return cas_num
+        if verbose and len(cas_numbers) > 1:
+            print(f'multiple PubChem CAS for {cid=}: {cas_numbers}')
+            print('returning first of these CAS')
+
+        # had previously sorted and returned first, but at least for my alpha-pinene
+        # (cid=6654) test, the first CAS in synonyms (80-56-8) is what we want, not the
+        # first in sorted order (2437-95-8).
+        #
+        # TODO sorting improve ability to repro cas in yuansheng excel file?
+        # can probably resolve those things be re-looking up cas though, so shouldn't
+        # need to change this
+        cas = cas_numbers[0]
+
+    return cas
 
 
 def compound2smiles(compound):
@@ -4031,8 +4055,8 @@ def odor_inventory_gsheet(use_cache=False, verbose=False):
 
     df.name = df.name.apply(normalize_name)
 
-    df = convert(df, to_type='inchi', allow_nan=False,
-        verbose=verbose, report_conflicts=False
+    df = convert(df, to_type='inchi', allow_nan=False, verbose=verbose,
+        report_conflicts=False
     )
 
     # TODO could copy name to original_name and normalize ids (+ name)
