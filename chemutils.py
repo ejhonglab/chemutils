@@ -844,30 +844,9 @@ _nonpersistent_cache = dict()
 # TODO ideally refactor so that lookup (e.g. fetching html) and parsing (of the lookup
 # output) can be separated (e.g. so we can try diff parsing strategies on cached html)
 def cached(fn):
-    global cache_changed
-    init()
-
     # TODO TODO document what this adds (does it add ignore_cache option?)
 
     # TODO TODO rename all f->from_type, t->to_type / similar
-
-    # Would need to modify if I wanted kwargs for the decorator that explicitly
-    # specify the from / to types.
-    # https://stackoverflow.com/questions/627501
-    f, t = fn.__name__.split('2')
-
-    #assert f in cache and t in cache[f], f'{f}->{t} not in cache'
-    # TODO maybe just handle correctly in init_cache / load_state?
-    # (would probably need to either hardcode new things to add alongside
-    # any new conversion fn defs, or enumerate types from possible conversion
-    # fn defs)
-    assert f in cache
-    if t not in cache[f]:
-        warn(f'trying to cache {fn.__name__}, but {t} not in {f} cache. adding empty '
-            f'dict for {t}.'
-        )
-        cache_changed = True
-        cache[f][t] = dict()
 
     # TODO maybe modify so manual hardcoding into `properties`
     # not required for fns referencing new "to" types?
@@ -890,6 +869,31 @@ def cached(fn):
             cached non-null values.
         """
         global cache_changed
+        init()
+
+        ################################################################################
+        # NOTE: moved from `cached` part before this
+        # TODO TODO TODO still work here? otherwise, need to do something else to avoid
+        # loading big cache on import
+        #
+        # Would need to modify if I wanted kwargs for the decorator that explicitly
+        # specify the from / to types.
+        # https://stackoverflow.com/questions/627501
+        f, t = fn.__name__.split('2')
+
+        #assert f in cache and t in cache[f], f'{f}->{t} not in cache'
+        # TODO maybe just handle correctly in init_cache / load_state?
+        # (would probably need to either hardcode new things to add alongside
+        # any new conversion fn defs, or enumerate types from possible conversion
+        # fn defs)
+        assert f in cache
+        if t not in cache[f]:
+            warn(f'trying to cache {fn.__name__}, but {t} not in {f} cache. adding '
+                f'empty dict for {t}.'
+            )
+            cache_changed = True
+            cache[f][t] = dict()
+        ################################################################################
 
         np_key = (f, t, key)
         # ignore_cache shouldn't apply to this one, as it is within each run
@@ -981,6 +985,7 @@ inchi_prefix2layer = {
 
 
 def basic_inchi(inchi, no_stereochem=False):
+    # TODO doc
     parts = inchi.split('/')
     if no_stereochem:
         keep = {'c','h'}
@@ -1003,10 +1008,10 @@ def inchi_layers(inchi):
 
 
 def inchi_layer_set(inchis):
-    from functools import reduce
+    # TODO doc
     # TODO why again can list 'sum' be taken directly by agg but
     # set.union can't? way to reference list sum as set.union is ref'd?
-    union = lambda x: reduce(set.union, x)
+    union = lambda x: functools.reduce(set.union, x)
     return inchis.apply(lambda x: set(inchi_layers(x))).agg(union)
 
 
