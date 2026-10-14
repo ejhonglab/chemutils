@@ -550,6 +550,8 @@ def add_hardcoded_overrides(_cache, overwrite_existing=True):
 
 
 def init_cache():
+    global cache_changed
+    cache_changed = True
     # TODO if load_state only adds properties (or whatever i rename that to)
     # behind into, should probably be consistent here
     # (same w/ other things not added behind all from types)
@@ -563,6 +565,8 @@ def init_cache():
 
 
 def _clear_one_cache(ft, tt):
+    global cache_changed
+    cache_changed = True
     assert ft in cache and tt in cache[ft]
     cache[ft][tt] = dict()
     # TODO need to do something w/ is_manual here too?
@@ -573,6 +577,9 @@ def _clear_one_cache(ft, tt):
 # too?
 # allow null as val? probably not? null allowed as keys, as-is?
 def _clear_vals_in_cache(ft, tt, vals):
+    global cache_changed
+    cache_changed = True
+
     assert ft in cache and tt in cache[ft]
 
     if type(vals) is str:
@@ -600,6 +607,9 @@ def _clear_vals_in_cache(ft, tt, vals):
 # also delete that part of is_manual
 def clear_cache(*args):
     global cache
+    global cache_changed
+    cache_changed = True
+
     if len(args) == 0:
         cache = init_cache()
 
@@ -619,6 +629,9 @@ def clear_cache(*args):
 # 0-arg version of clear_cache?)
 def _clear_null_cache_vals(write=True):
     global cache
+    global cache_changed
+    cache_changed = True
+
     for from_type, to_type_to_cache_dict in cache.items():
         for to_type, f2t_dict in to_type_to_cache_dict.items():
             # Need list() since .items() is an iterator that expects contents
@@ -698,10 +711,19 @@ def load_state():
 
 
 def save_cache(merge_with_saved=True):
+    # TODO TODO TODO at least doc merged_with_saved (and why do we even need that? dont
+    # we load saved at init? delete that path?)
     """
     Load old cache first, so that clear_cache doesn't have to worry about
     screwing up on-disk cache when atexit call to save_cache triggers.
     """
+    # TODO need this to just access changed value of global, or only to write
+    # (i think just to write, so i should be able to remove here)
+    global cache_changed
+    #
+    if not cache_changed:
+        return
+
     # TODO why did i ever want merge_with_saved again??
     if merge_with_saved:
         # TODO need "global cache", as long as cache def is below fn def, or
@@ -734,51 +756,59 @@ def save_cache(merge_with_saved=True):
     # TODO TODO TODO change so it write to a temp file and then moves over old thing
     # when done (to be more atomic, so being interrupted isn't as bad)
     with open(cache_file, 'wb') as f:
-        # TODO TODO TODO is is_manual ever curently defined?
+        # TODO is is_manual ever curently defined?
         data = {'cache': to_save, 'is_manual': is_manual}
         pickle.dump(data, f)
 
 
-# TODO fn to manually enter persistent overrides?
+cache = None
+is_manual = None
+cache_changed = False
+def init():
+    global cache, is_manual
+    # TODO test
+    cache, is_manual = load_state()
 
-# TODO test
-cache, is_manual = load_state()
+    if cache is not None:
+        return
 
-# TODO maybe factor into load_state / some other check fn called there
-# TODO maybe add to cache fn to check units of these if they are properties?
-# TODO TODO why did i decide to do this on load? why not just do it before each addition
-# to cache / on write?
-# TODO TODO TODO change to checking in a wrapper of each lookup fn / similar
-for prop, preferred_unit_str in property2preferred_units.items():
-    prop_units = ureg(preferred_unit_str)
-    prop_unit_key = f'{prop}_units'
-    #print('checking cache units for:', prop)
-    for ft, ft_cache in cache.items():
-        if prop in ft_cache.keys():
-            f2p_cache = ft_cache[prop]
-            for f, p in f2p_cache.items():
-                assert prop in p and prop_unit_key in p
-                # TODO delete
-                # a crude check that the object is a pd.Series
-                #assert hasattr(p, 'shape'), 'not a series'
-                #
-                assert is_series(p), 'not a series'
-
-                if isnull(p):
-                    # TODO delete after it is clear it is equiv to my own
-                    # `isnull`
-                    # This was the old way I calculated it.
-                    assert pd.isnull(p[prop])
+    # TODO maybe factor into load_state / some other check fn called there
+    # TODO maybe add to cache fn to check units of these if they are properties?
+    # TODO TODO why did i decide to do this on load? why not just do it before each addition
+    # to cache / on write?
+    # TODO TODO TODO change to checking in a wrapper of each lookup fn / similar
+    for prop, preferred_unit_str in property2preferred_units.items():
+        prop_units = ureg(preferred_unit_str)
+        prop_unit_key = f'{prop}_units'
+        #print('checking cache units for:', prop)
+        for ft, ft_cache in cache.items():
+            if prop in ft_cache.keys():
+                f2p_cache = ft_cache[prop]
+                for f, p in f2p_cache.items():
+                    assert prop in p and prop_unit_key in p
+                    # TODO delete
+                    # a crude check that the object is a pd.Series
+                    #assert hasattr(p, 'shape'), 'not a series'
                     #
-                    continue
+                    assert is_series(p), 'not a series'
 
-                # TODO should it be an error for units to not be specified?
-                # (probably, that's how i handle it in some lookup fns)
-                # (-> so delete any entries in cache that have null units!!!)
-                c_units = p[prop_unit_key]
-                assert prop_units.check(c_units), f'{prop_units} != {c_units}'
+                    if isnull(p):
+                        # TODO delete after it is clear it is equiv to my own
+                        # `isnull`
+                        # This was the old way I calculated it.
+                        assert pd.isnull(p[prop])
+                        #
+                        continue
 
-atexit.register(save_cache)
+                    # TODO should it be an error for units to not be specified?
+                    # (probably, that's how i handle it in some lookup fns)
+                    # (-> so delete any entries in cache that have null units!!!)
+                    c_units = p[prop_unit_key]
+                    assert prop_units.check(c_units), f'{prop_units} != {c_units}'
+
+    # TODO TODO TODO only save if something changed (how to track? easier to wrap all
+    # writes to cache? might be a pain at this point...)
+    atexit.register(save_cache)
 
 
 def allowed_kwarg(fn: Callable, kwarg_name: str) -> bool:
@@ -814,6 +844,9 @@ _nonpersistent_cache = dict()
 # TODO ideally refactor so that lookup (e.g. fetching html) and parsing (of the lookup
 # output) can be separated (e.g. so we can try diff parsing strategies on cached html)
 def cached(fn):
+    global cache_changed
+    init()
+
     # TODO TODO document what this adds (does it add ignore_cache option?)
 
     # TODO TODO rename all f->from_type, t->to_type / similar
@@ -833,6 +866,7 @@ def cached(fn):
         warn(f'trying to cache {fn.__name__}, but {t} not in {f} cache. adding empty '
             f'dict for {t}.'
         )
+        cache_changed = True
         cache[f][t] = dict()
 
     # TODO maybe modify so manual hardcoding into `properties`
@@ -855,6 +889,8 @@ def cached(fn):
         leave_nonnull_cache: if True, null values will not overwrite
             cached non-null values.
         """
+        global cache_changed
+
         np_key = (f, t, key)
         # ignore_cache shouldn't apply to this one, as it is within each run
         if np_key in _nonpersistent_cache:
@@ -913,7 +949,7 @@ def cached(fn):
         # TODO + test it
         if not (leave_nonnull_cache and isnull(value) and
             key in ft_cache and not isnull(ft_cache[key])):
-
+            cache_changed = True
             ft_cache[key] = value
 
         return value
@@ -1123,6 +1159,9 @@ def convert(chem_id, from_type=None, to_type='inchi', *, verbose: bool = False,
         allow_nan: whether to err if any lookups fail (does not depend on
             `dropna=False`)
     """
+    global cache_changed
+    init()
+
     def conversion_fail_errmsg():
         return f'conversion from {from_type} to {to_type} failed for'
 
@@ -1547,6 +1586,7 @@ def convert(chem_id, from_type=None, to_type='inchi', *, verbose: bool = False,
                 to_type_cache = cache[from_type][tt]
                 # To not overwrite hardcoded values for other types.
                 if chem_id not in to_type_cache:
+                    cache_changed = True
                     to_type_cache[chem_id] = None
 
             conversion_fail_err()
@@ -1555,6 +1595,7 @@ def convert(chem_id, from_type=None, to_type='inchi', *, verbose: bool = False,
         if verbose:
             print(f'CID={cid}')
 
+        cache_changed = True
         cache[from_type]['cid'][chem_id] = cid
 
     # TODO TODO should i also support some way of directly going from from_type
@@ -1567,6 +1608,7 @@ def convert(chem_id, from_type=None, to_type='inchi', *, verbose: bool = False,
     # TODO TODO TODO possible to cache this? Compounds pickleable?
 
     if 'compound' not in cache['cid']:
+        cache_changed = True
         cache['cid']['compound'] = dict()
 
     elif cid in cache['cid']['compound']:
@@ -1595,6 +1637,7 @@ def convert(chem_id, from_type=None, to_type='inchi', *, verbose: bool = False,
 
         # TODO delete???
         # TODO this being saved by atexit?
+        cache_changed = True
         cache['cid']['compound'][cid] = compound
         #
 
@@ -1613,6 +1656,7 @@ def convert(chem_id, from_type=None, to_type='inchi', *, verbose: bool = False,
             to_type_dict = cache[from_type][tt]
             # To not overwrite hardcoded values for other types.
             if chem_id not in to_type_dict:
+                cache_changed = True
                 to_type_dict[chem_id] = None
 
         conversion_fail_err()
@@ -1634,6 +1678,7 @@ def convert(chem_id, from_type=None, to_type='inchi', *, verbose: bool = False,
     else:
         to_type_val = compound2t_fn(compound)
 
+    cache_changed = True
     cache[from_type][to_type][chem_id] = to_type_val
 
     if verbose and to_type_val is None:
@@ -2890,6 +2935,9 @@ def pubchemprops_lookup(inchi, prop_name, expected_units=None,
 #@opt_pint_return
 @cached
 def inchi2water_solubility(inchi, verbose=False):
+    # TODO TODO doc
+    # TODO TODO TODO + provide example (/fn) using this + vapor pressure [/whatever] to
+    # estimate henry's law constant
     ret_keys = [
         'water_solubility',
         'water_solubility_sources',
@@ -3128,6 +3176,7 @@ def inchi2density(inchi, verbose=False):
 #@opt_pint_return
 @cached
 def inchi2nist_k_henry(inchi, verbose=False):
+    # TODO TODO include link and citation info here
     ret_keys = ['k_henry', 'k_henry_sources', 'k_henry_units']
 
     # TODO TODO refactor
@@ -3872,6 +3921,10 @@ def add_properties_to_cache(df, overwrite_close=False, dropna=True,
     verbose=False):
     """Adds chemical properties in `df` to cache under 'inchi'.
     """
+    global cache_changed
+    global cache, is_manual
+    init()
+
     # So we don't have to check whether values behind each instance
     # of same inchi are consistent.
     assert not df.inchi.duplicated().any(), 'inchi can not have duplicates'
@@ -3907,7 +3960,11 @@ def add_properties_to_cache(df, overwrite_close=False, dropna=True,
                     raise ValueError(f'{row.Index} {prop} missing source')
 
                 inchi2prop_cache[i] = new_entry
-                is_manual[('inchi', prop, i)] = True
+                key = ('inchi', prop, i)
+                if key not in is_manual or is_manual[key] != True:
+                    cache_changed = True
+
+                is_manual[key] = True
                 add_count += 1
             #
 

@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-
 """
 Takes chemical name as the lone command line argument.
 
@@ -28,7 +27,6 @@ def ul_soluble_in_ml_water(ml_water, water_solubility, density=None,
 
     density (pint.Quantity): mass / volume density of target solute
     """
-
     if density is None or molar_mass is not None:
         raise NotImplementedError
 
@@ -55,7 +53,6 @@ def print_vol_soluble_in_water_vols(name_or_names, water_vols_ml=(2.0, 20.0),
 
     Returns `bool` indicating whether (all) lookup(s) were successful.
     """
-
     if type(name_or_names) is not str:
         if _recursing:
             raise ValueError('name_or_names must be str or iterable of str')
@@ -190,6 +187,11 @@ def print_vol_soluble_in_water_vols(name_or_names, water_vols_ml=(2.0, 20.0),
 
 
 def main():
+    # TODO TODO TODO what is an example file i was using this? was it expect4ed to
+    # already have water solubility info in it? otherwise, how was i looking up /
+    # calculating / estimating that (and provide example of that, and also how to
+    # estimate henry's law constant using that and vapor pressure [+fn for that, if not
+    # already?])
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('input',
         help='Chemical name or a file with one chemical name per line.'
@@ -223,7 +225,6 @@ def main():
             # Just in case dependence on pandas is weakened in chemutils.py in
             # the future...
             import pandas as pd
-            
             data = pd.read_csv(fname)
             nc = [c for c in data.columns if c in name_cols]
             if len(nc) != 1:
