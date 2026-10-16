@@ -363,10 +363,11 @@ def load_manual_properties(to_update):
         df[name_col] = df[name_col].ffill()
         assert not df.duplicated(subset=['property', name_col, 'sources']).any()
 
-    # NOTE: I only added group_keys=False because when running w/ pandas==1.5.3, I got a
-    # FutureWarning saying that would preserve old behavior. not sure it matters for me
-    # here...
-    df = df.groupby('property', group_keys=False).apply(change_frame_units)
+    # NOTE: not using groupby(...).apply(change_frame_units), since pandas>=3 excludes
+    # the grouping column ('property') from the frames passed to the fn.
+    df = pd.concat([
+        change_frame_units(gdf, prop=prop) for prop, gdf in df.groupby('property')
+    ])
     assert (df.groupby('property').units.nunique() == 1).all()
 
     # So far, this is the only "to_type" I've used for any property lookups.
