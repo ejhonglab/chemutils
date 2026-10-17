@@ -1,3 +1,38 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chemutils"
+version = "0.1.0"
+requires-python = ">=3.8"
+dependencies = [
+    "numpy",
+    "pandas",
+    "pubchempy",
+    "pint",
+    "openpyxl",
+    "XlsxWriter",
+    # This version seems to have working InChI support installed directly from PyPi.
+    # Earlier versions probably do as well but untested.
+    "rdkit>=2023.3.1",
+    "chemspipy",
+    # TODO TODO add current verison of requests
+    "requests",
+    "urllib3",
+    "beautifulsoup4",
+    # For BeautifulSoup 'xml' parser and pd.read_html
+    "lxml",
+    # My fork, which adds the `cid` kwarg to `get_second_layer_props`
+    "pubchemprops @ git+https://github.com/tom-f-oconnell/pubchemprops",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.setuptools]
+py-modules = ["chemutils"]
+
 # TODO actually need any of this? can i move addopts stuff to just some default global
 # config for myself? (copied from hong2p pytest.ini, but pretty barebones now)
 [tool.pytest.ini_options]
@@ -13,3 +48,6 @@ addopts = [
     "--ignore=test/test_pubchemprops_string_parsing.py",
 ]
 doctest_optionflags = ["NORMALIZE_WHITESPACE"]
+markers = [
+    "network: requires internet access (deselect with '-m \"not network\"')",
+]

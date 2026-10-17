@@ -2,6 +2,7 @@
 
 import pandas as pd
 import pubchempy as pcp
+import pytest
 
 from chemutils import is_one2one, compound2cas, allowed_kwarg
 import chemutils as cu
@@ -40,6 +41,7 @@ def test_is_one2one_with_null():
         assert dropna == _is_one2one(xs2, ys2, dropna=dropna)
 
 
+@pytest.mark.network
 def test_compound2cas():
     # alpha-pinene
     # https://pubchem.ncbi.nlm.nih.gov/compound/6654

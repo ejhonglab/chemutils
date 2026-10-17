@@ -6,10 +6,13 @@
 # could also work in Python 2.
 from __future__ import unicode_literals
 
-import atexit
+import base64
 from collections import Counter
+from collections.abc import MutableMapping
 import functools
 import inspect
+from io import StringIO
+import json
 import logging
 from logging import warning as warn
 import os
@@ -18,6 +21,7 @@ from pathlib import Path
 import pickle
 from pprint import pformat
 import re
+import sqlite3
 import time
 from typing import Optional, Callable
 import traceback
@@ -131,7 +135,11 @@ ureg = pint.UnitRegistry()
 # not exactly sure what this does...
 pint.set_application_registry(ureg)
 
-cache_file = os.path.expanduser(join('~', '.chemutils_cache.p'))
+# Persistent cache of lookup results (an SQLite database). If the CHEMUTILS_CACHE
+# environment variable is set, it is used as the path instead (e.g. in tests).
+default_cache_file = os.path.expanduser(join('~', '.chemutils_cache.sqlite'))
+# Cache format used before the SQLite one. Migrate with scripts/migrate_cache.py
+old_pickle_cache_file = os.path.expanduser(join('~', '.chemutils_cache.p'))
 
 chemspipy_api_key = os.environ.get('CHEMSPIDER_API_KEY')
 
@@ -148,6 +156,8 @@ chem_id_types = [
     'cid',
     'inchikey',
     'inchi',
+    # Without stereochemistry (see compound2smiles). 'isomeric_smiles' (with
+    # stereochemistry) is also supported as a `convert` `to_type`.
     'smiles',
     'cas',
     'name',
@@ -457,18 +467,9 @@ def is_series(obj):
     # qualified path (or comparison of type to that of initialized empty one?)
     # (if not, maybe just use isinstance(obj, pd.Series)? or issubclass?)
 
-    # Adapted from: https://stackoverflow.com/questions/2020014
-    _type = type(obj)
-    # The intermediate part (of __module__) that is not matched is:
-    # 'core.series' for me, w/ pandas 0.25.1
-    if _type.__name__ == 'Series' and _type.__module__.startswith('pandas.'):
-        return True
-
-    # TODO subclasses? (not that it really matters for any of my use cases
-    # now... it just might if i wanted to solve the is_series matter once and
-    # for all...)
-
-    return False
+    # NOTE: previously checked type(obj).__module__.startswith('pandas.'), but in
+    # pandas>=3 Series.__module__ is just 'pandas', so that was False for all Series.
+    return isinstance(obj, pd.Series)
 
 
 # TODO TODO use this in all the other places that do something similar
@@ -503,119 +504,368 @@ def isnull(x):
             return False
 
 
-def add_hardcoded_overrides(_cache, overwrite_existing=True):
+def _values_equal(a, b) -> bool:
+    """Returns whether two cache values are equal (handling Series and nulls)."""
+    if is_series(a) or is_series(b):
+        return is_series(a) and is_series(b) and a.equals(b)
+
+    if isnull(a) or isnull(b):
+        return isnull(a) and isnull(b)
+
+    return bool(a == b)
+
+
+_hardcoded_normalized = None
+def _get_hardcoded():
+    """Returns `hardcoded` and `hardcoded_type2null_keys` values, with normalized keys.
+
+    Returned dict is of the form {from_type: {to_type: {normalized_key: value}}}.
+
+    Built on first use, since the normalization fns are defined below. These values
+    take precedence over (and are never written to) the persistent cache.
     """
-    Args:
-    overwrite_existing (bool): If True, non-null keys will not be overwritten by
-        values in `hardcoded` (though values in `hardcoded_type2null_keys` will
-        still overwrite with `None` unconditionally).
-    """
+    global _hardcoded_normalized
+    if _hardcoded_normalized is not None:
+        return _hardcoded_normalized
+
+    normed = dict()
+    for ft, tts in hardcoded.items():
+        for tt, f2t_dict in tts.items():
+            normed_f2t = normed.setdefault(ft, dict()).setdefault(tt, dict())
+            for k, v in f2t_dict.items():
+                nk = normalize_id(ft, k)
+                if nk in normed_f2t and not _values_equal(normed_f2t[nk], v):
+                    raise ValueError(f'hardcoded {ft}->{tt} values for keys that '
+                        f'normalize to {nk!r} conflict'
+                    )
+                normed_f2t[nk] = v
+
     for ft, null_keys in hardcoded_type2null_keys.items():
         for nk in null_keys:
+            nk = normalize_id(ft, nk)
             for tt in chem_id_types:
-                _cache[ft][tt][nk] = None
+                normed.setdefault(ft, dict()).setdefault(tt, dict()).setdefault(nk, None)
 
-    # TODO delete
-    first = True
-    #
-    for ft, tts in hardcoded.items():
-        for tt in tts:
-            if overwrite_existing:
-                _cache[ft][tt].update(tts[tt])
-
-            # TODO TODO add a test that ensures this is equivalent to the update
-            # call in the case where there are no overlap between existing
-            # values and those to be hardcoded
-            else:
-                f2t_dict = _cache[ft][tt]
-                hardcoded_f2t_dict = tts[tt]
-                for hk, hv in hardcoded_f2t_dict.items():
-                    if hk not in f2t_dict or isnull(f2t_dict[hk]):
-                        # TODO delete
-                        '''
-                        if first:
-                            first = False
-                            if hk not in f2t_dict:
-                                print('Not already in cache')
-                            else:
-                                print('Existing was null')
-                            print("_cache['" + "']['".join([ft, tt, hk]) + "']")
-                            print('Hardcoding:', hk, hv)
-                            import ipdb; ipdb.set_trace()
-                        '''
-                        #
-                        f2t_dict[hk] = hv
-
-    if not overwrite_existing and not first:
-        import ipdb; ipdb.set_trace()
+    _hardcoded_normalized = normed
+    return normed
 
 
-def init_cache():
-    global cache_changed
-    cache_changed = True
-    # TODO if load_state only adds properties (or whatever i rename that to)
-    # behind into, should probably be consistent here
-    # (same w/ other things not added behind all from types)
-    # TODO maybe modify this fn so it can init only sub-caches not in current
-    # cache (and then always call init_cache some way like that on loading)?
-    _cache = {ft: {tt: dict() for tt in chem_id_types + properties}
-        for ft in chem_id_types
+_type_tag = '__chemutils_type__'
+
+def _to_json_obj(value):
+    if value is None or isinstance(value, (bool, str)):
+        return value
+
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+
+    if isinstance(value, (float, np.floating)):
+        return float(value)
+
+    if is_series(value):
+        return {_type_tag: 'Series',
+            'dtype': str(value.dtype),
+            'name': _to_json_obj(value.name),
+            'index': [_to_json_obj(x) for x in value.index],
+            'values': [_to_json_obj(x) for x in value],
+        }
+
+    if isinstance(value, Compound):
+        return {_type_tag: 'Compound', 'record': value.record}
+
+    return {_type_tag: 'pickle',
+        'data': base64.b64encode(pickle.dumps(value)).decode('ascii')
     }
-    add_hardcoded_overrides(_cache)
-    return _cache
+
+
+def _from_json_obj(obj):
+    if not isinstance(obj, dict):
+        return obj
+
+    value_type = obj[_type_tag]
+    if value_type == 'Series':
+        return pd.Series([_from_json_obj(x) for x in obj['values']],
+            index=[_from_json_obj(x) for x in obj['index']],
+            dtype=obj['dtype'], name=_from_json_obj(obj['name'])
+        )
+
+    elif value_type == 'Compound':
+        return Compound(obj['record'])
+
+    elif value_type == 'pickle':
+        return pickle.loads(base64.b64decode(obj['data']))
+
+    raise ValueError(f'unrecognized cache value type: {value_type}')
+
+
+def _encode_value(value) -> str:
+    """Returns JSON str for storing `value` in the cache database."""
+    return json.dumps(_to_json_obj(value))
+
+
+def _decode_value(text: str):
+    return _from_json_obj(json.loads(text))
+
+
+def cache_path() -> Path:
+    """Returns path to the persistent cache (CHEMUTILS_CACHE env var, if set).
+    """
+    return Path(os.environ.get('CHEMUTILS_CACHE', default_cache_file)).expanduser()
+
+
+_cache_schema_version = 1
+
+def _connect(path) -> sqlite3.Connection:
+    """Returns connection to cache database at `path`, creating it if needed.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    # isolation_level=None for autocommit, so each write is saved (and visible to
+    # other processes) immediately.
+    conn = sqlite3.connect(path, timeout=30, isolation_level=None)
+    # WAL + synchronous=NORMAL make each commit cheap (no fsync per write).
+    conn.execute('PRAGMA journal_mode=WAL')
+    conn.execute('PRAGMA synchronous=NORMAL')
+
+    version = conn.execute('PRAGMA user_version').fetchone()[0]
+    if version not in (0, _cache_schema_version):
+        conn.close()
+        raise RuntimeError(f'cache at {path} has unsupported schema version {version}')
+
+    # key has no declared type, so CIDs are stored as integers and other IDs as text.
+    # value is JSON (see _encode_value).
+    conn.execute('CREATE TABLE IF NOT EXISTS entries ('
+        'from_type TEXT NOT NULL, '
+        'to_type TEXT NOT NULL, '
+        'key NOT NULL, '
+        'value TEXT NOT NULL, '
+        'manual INTEGER NOT NULL DEFAULT 0, '
+        'updated REAL NOT NULL, '
+        'PRIMARY KEY (from_type, to_type, key)'
+        ') WITHOUT ROWID'
+    )
+    conn.execute(f'PRAGMA user_version = {_cache_schema_version}')
+    return conn
+
+
+# Sentinel returned by _cache_get when there is no entry.
+_missing = object()
+
+_conn = None
+# (CHEMUTILS_CACHE value, pid) _conn was opened with
+_conn_state = None
+
+# (from_type, to_type, key) -> value (or _missing), for entries read from the database
+# in this process.
+_memo_read = dict()
+# (from_type, to_type, key) -> value, for entries written in this process.
+_memo_written = dict()
+# Set by clear_cache(). If True, only values written in this process are used.
+_session_only = False
+
+def _reset_cache_state():
+    """Closes cache database and clears in-memory state (e.g. to change cache path).
+    """
+    global _conn, _conn_state, _session_only
+
+    # Not closing connections inherited from a parent process, as that can break the
+    # parent's locks.
+    if _conn is not None and _conn_state[1] == os.getpid():
+        _conn.close()
+
+    _conn = None
+    _conn_state = None
+    _memo_read.clear()
+    _memo_written.clear()
+    _session_only = False
+
+
+def _get_conn() -> sqlite3.Connection:
+    global _conn, _conn_state
+
+    state = (os.environ.get('CHEMUTILS_CACHE'), os.getpid())
+    if _conn is not None and state == _conn_state:
+        return _conn
+
+    _reset_cache_state()
+
+    path = cache_path()
+    _conn = _connect(path)
+    _conn_state = state
+
+    if (path == Path(default_cache_file) and exists(old_pickle_cache_file) and
+        _conn.execute('SELECT 1 FROM entries LIMIT 1').fetchone() is None):
+
+        warn(f'cache at {path} is empty, but old cache exists at '
+            f'{old_pickle_cache_file}. migrate it with: '
+            f'python {join(pkg_data_dir, "scripts", "migrate_cache.py")}'
+        )
+
+    return _conn
+
+
+def _cache_get(from_type: str, to_type: str, key, *, session_only: bool = False,
+    use_hardcoded: bool = True):
+    """Returns cached value for (already normalized) `key`, or `_missing`.
+
+    Hardcoded values take precedence over everything else.
+
+    Args:
+        session_only: if True, only values written during this process are used
+            (to implement `ignore_cache=True`).
+    """
+    conn = _get_conn()
+
+    if use_hardcoded:
+        hardcoded_f2t = _get_hardcoded().get(from_type, dict()).get(to_type)
+        if hardcoded_f2t is not None and key in hardcoded_f2t:
+            return hardcoded_f2t[key]
+
+    memo_key = (from_type, to_type, key)
+    if memo_key in _memo_written:
+        return _memo_written[memo_key]
+
+    if session_only or _session_only:
+        return _missing
+
+    if memo_key in _memo_read:
+        return _memo_read[memo_key]
+
+    row = conn.execute('SELECT value FROM entries WHERE from_type = ? AND to_type = ? '
+        'AND key = ?', memo_key
+    ).fetchone()
+    value = _missing if row is None else _decode_value(row[0])
+    _memo_read[memo_key] = value
+    return value
+
+
+def _cache_set(from_type: str, to_type: str, key, value, *, manual: bool = False
+    ) -> None:
+    """Saves `value` for (already normalized) `key` to the cache.
+    """
+    conn = _get_conn()
+    conn.execute('INSERT OR REPLACE INTO entries VALUES (?, ?, ?, ?, ?, ?)',
+        (from_type, to_type, key, _encode_value(value), int(manual), time.time())
+    )
+    memo_key = (from_type, to_type, key)
+    _memo_read.pop(memo_key, None)
+    _memo_written[memo_key] = value
+
+
+def _cache_delete(from_type: str, to_type: str, keys=None) -> None:
+    """Deletes (already normalized) `keys` (all, if None) from cache.
+    """
+    conn = _get_conn()
+    if keys is None:
+        conn.execute('DELETE FROM entries WHERE from_type = ? AND to_type = ?',
+            (from_type, to_type)
+        )
+        def matches(memo_key):
+            return memo_key[:2] == (from_type, to_type)
+    else:
+        keys = set(keys)
+        conn.executemany('DELETE FROM entries WHERE from_type = ? AND to_type = ? '
+            'AND key = ?', [(from_type, to_type, k) for k in keys]
+        )
+        def matches(memo_key):
+            return memo_key[:2] == (from_type, to_type) and memo_key[2] in keys
+
+    for memo in (_memo_read, _memo_written):
+        for memo_key in [k for k in memo if matches(k)]:
+            del memo[memo_key]
+
+
+class _SubCache(MutableMapping):
+    """Persistent cache values for one (from_type, to_type) pair.
+
+    Keys are normalized on access, so raw and normalized IDs refer to the same entry.
+    Does not include hardcoded values.
+    """
+    def __init__(self, from_type: str, to_type: str):
+        self.from_type = from_type
+        self.to_type = to_type
+
+    def _key(self, key):
+        return normalize_id(self.from_type, key)
+
+    def __getitem__(self, key):
+        value = _cache_get(self.from_type, self.to_type, self._key(key),
+            use_hardcoded=False
+        )
+        if value is _missing:
+            raise KeyError(key)
+        return value
+
+    def __setitem__(self, key, value):
+        _cache_set(self.from_type, self.to_type, self._key(key), value)
+
+    def __delitem__(self, key):
+        self[key]
+        _cache_delete(self.from_type, self.to_type, [self._key(key)])
+
+    def __iter__(self):
+        rows = _get_conn().execute('SELECT key FROM entries WHERE from_type = ? AND '
+            'to_type = ?', (self.from_type, self.to_type)
+        ).fetchall()
+        return iter([r[0] for r in rows])
+
+    def __len__(self):
+        return _get_conn().execute('SELECT COUNT(*) FROM entries WHERE from_type = ? '
+            'AND to_type = ?', (self.from_type, self.to_type)
+        ).fetchone()[0]
+
+
+class _Cache:
+    """View of persistent cache, as `cache[from_type][to_type][chem_id]`.
+    """
+    def __getitem__(self, from_type: str):
+        return _FromTypeCache(from_type)
+
+class _FromTypeCache:
+    def __init__(self, from_type: str):
+        self.from_type = from_type
+
+    def __getitem__(self, to_type: str) -> _SubCache:
+        return _SubCache(self.from_type, to_type)
+
+cache = _Cache()
 
 
 def _clear_one_cache(ft, tt):
-    global cache_changed
-    cache_changed = True
-    assert ft in cache and tt in cache[ft]
-    cache[ft][tt] = dict()
-    # TODO need to do something w/ is_manual here too?
-    save_cache(merge_with_saved=False)
+    _cache_delete(ft, tt)
 
 
-# TODO maybe relax str restriction on values so this works in compound ID case
-# too?
-# allow null as val? probably not? null allowed as keys, as-is?
 def _clear_vals_in_cache(ft, tt, vals):
-    global cache_changed
-    cache_changed = True
-
-    assert ft in cache and tt in cache[ft]
-
-    if type(vals) is str:
+    if type(vals) is str or not hasattr(vals, '__iter__'):
         vals = [vals]
-    else:
-        try:
-            iter(vals)
-        except TypeError:
-            raise ValueError('vals must be str or iterable of strs')
 
-    c = cache[ft][tt]
-    for v in vals:
-        assert type(v) is str
-        try:
-            del c[v]
-        # Does nothing and moves on to next value if any given val not present.
-        except KeyError:
-            pass
-
-    # TODO need to do something w/ is_manual here too?
-    save_cache(merge_with_saved=False)
+    _cache_delete(ft, tt, [normalize_id(ft, v) for v in vals])
 
 
-# TODO TODO if any of these clearing fns delete stuff that has is_manual set,
-# also delete that part of is_manual
 def clear_cache(*args):
-    global cache
-    global cache_changed
-    cache_changed = True
+    """
+    clear_cache(): ignores all previously saved values for the rest of this process,
+        without changing the saved cache (values looked up after this are still saved,
+        and used).
+
+    clear_cache(from_type, to_type): deletes all saved values for this conversion.
+
+    clear_cache(from_type, to_type, vals): deletes saved values for input IDs `vals`.
+    """
+    global _session_only
 
     if len(args) == 0:
-        cache = init_cache()
+        _get_conn()
+        _memo_read.clear()
+        _memo_written.clear()
+        _session_only = True
+        return
 
-    elif len(args) == 2:
-        # args: (from_type, to_type)
+    if args[0] not in chem_id_types:
+        raise ValueError(f'from_type must be one of {chem_id_types}')
+
+    if len(args) == 2:
         _clear_one_cache(*args)
 
     elif len(args) == 3:
@@ -625,191 +875,50 @@ def clear_cache(*args):
         raise ValueError('can only call with 0, 2, or 3 arguments')
 
 
-# TODO options to clear null in specific cache?
-# and do i really want this write arg? (why didn't i have it above, in old
-# 0-arg version of clear_cache?)
-def _clear_null_cache_vals(write=True):
-    global cache
-    global cache_changed
-    cache_changed = True
+def _clear_null_cache_vals():
+    """Deletes all null values (including all-null Series) from cache.
+    """
+    rows = _get_conn().execute('SELECT from_type, to_type, key, value FROM entries'
+        ).fetchall()
 
-    for from_type, to_type_to_cache_dict in cache.items():
-        for to_type, f2t_dict in to_type_to_cache_dict.items():
-            # Need list() since .items() is an iterator that expects contents
-            # not to change.
-            for f, t in list(f2t_dict.items()):
-                # TODO TODO use this commented bit to replace the below after
-                # verifying isnull works
-                #if isnull(t):
-                #    del f2t_dict[f]
+    to_delete = dict()
+    for from_type, to_type, key, value in rows:
+        if isnull(_decode_value(value)):
+            to_delete.setdefault((from_type, to_type), []).append(key)
 
-                if not hasattr(t, 'shape') and pd.isnull(t):
-                    del f2t_dict[f]
-
-                # TODO maybe error handling in case it had shape but not .all()
-                # (or more specific way of detecting series)
-                elif hasattr(t, 'shape') and t.isnull().all():
-                    del f2t_dict[f]
-
-    if write:
-        # TODO and why merge_with_saved=False here? document that param...
-        save_cache(merge_with_saved=False)
+    for (from_type, to_type), keys in to_delete.items():
+        _cache_delete(from_type, to_type, keys)
 
 
 def delete_cache():
-    """Deletes and clears the cache at cache_file
+    """Deletes the cache database at `cache_path()`.
     """
-    clear_cache()
-    if exists(cache_file):
-        os.remove(cache_file)
+    path = cache_path()
+    _reset_cache_state()
+    for p in (path, Path(f'{path}-wal'), Path(f'{path}-shm')):
+        if p.exists():
+            p.unlink()
 
 
-def load_state():
-    """Loads `cache` and `is_manual` from `cache_file`.
+def _check_property_value(prop: str, value) -> None:
+    """Raises ValueError if `value` (a lookup output for `prop`) has unexpected units.
     """
-    if exists(cache_file):
-        try:
-            with open(cache_file, 'rb') as f:
-                data = pickle.load(f)
-                _cache = data['cache']
-                _is_manual = data['is_manual']
-
-            # TODO delete (was planning to use to load inverted maps here)
-            '''
-            for from_type, to_type_dict in _cache.items():
-                for to_type, f2t_cache in to_type_dict.items():
-            '''
-            #
-
-            add_hardcoded_overrides(_cache, overwrite_existing=False)
-
-            # TODO shouldn't this logic (also, w/o refactoring) be in
-            # init_cache?
-            for k in properties:
-                if k not in _cache['inchi']:
-                    _cache['inchi'][k] = dict()
-
-            return _cache, _is_manual
-
-        # TODO TODO TODO what raises this ValueError????
-        # (pickle load? put it only around the potentially offending section!!!)
-        except ValueError as e:
-            raise
-            # TODO TODO probably just print warning, maybe print a command
-            # that can be manually run to delete cache / prompt about whether
-            # cache should be deleted.
-            # TODO maybe all changes to the cache should be round tripped
-            # through this load, to check this doesn't happen?
-            '''
-            print('Cache was in unreadable format. Deleting.')
-            delete_cache()
-            # TODO cache guaranteed to be defined here...? not sure it is. test.
-            # Will have already been init'd in delete_cache call.
-            return cache, dict()
-            '''
-    else:
-        return init_cache(), dict()
-
-
-def save_cache(merge_with_saved=True):
-    # TODO TODO TODO at least doc merged_with_saved (and why do we even need that? dont
-    # we load saved at init? delete that path?)
-    """
-    Load old cache first, so that clear_cache doesn't have to worry about
-    screwing up on-disk cache when atexit call to save_cache triggers.
-    """
-    # TODO need this to just access changed value of global, or only to write
-    # (i think just to write, so i should be able to remove here)
-    global cache_changed
-    #
-    if not cache_changed:
+    if prop not in property2preferred_units or isnull(value):
         return
 
-    # TODO why did i ever want merge_with_saved again??
-    if merge_with_saved:
-        # TODO need "global cache", as long as cache def is below fn def, or
-        # what?  if that's all, move "cache = load_state()" just above this, and
-        # declare as global in load_state, cause circularity (?)
-        # TODO also want to hae merge_with_saved apply to is_manual somewhat
-        # similarly (that's the second returned value currently ignored here)?
-        old_cache, _ = load_state()
+    unit_key = f'{prop}_units'
+    if not is_series(value) or prop not in value or unit_key not in value:
+        raise ValueError(f'{prop} value should be a Series with {prop} and {unit_key}:'
+            f'\n{value}'
+        )
 
-        # So any current values overwrite old_cache values.
-        assert old_cache.keys() == cache.keys()
-        for from_type, to_type_dicts in cache.items():
-            old_cache_to_type_dicts = old_cache[from_type]
-            # Needed to comment to modify cache to add 'density' key behind
-            # 'inchi'.
-            #assert old_cache_to_type_dicts.keys() == to_type_dicts.keys()
-            for to_type, f2t_dict in to_type_dicts.items():
-                if to_type not in old_cache_to_type_dicts:
-                    old_cache_to_type_dicts[to_type] = dict()
-
-                # TODO how to allow deleting keys (from terminal dict)?
-
-                old_cache_f2t_dict = old_cache_to_type_dicts[to_type]
-                old_cache_f2t_dict.update(f2t_dict)
-
-        to_save = old_cache
-    else:
-        to_save = cache
-
-    # TODO TODO TODO change so it write to a temp file and then moves over old thing
-    # when done (to be more atomic, so being interrupted isn't as bad)
-    with open(cache_file, 'wb') as f:
-        # TODO is is_manual ever curently defined?
-        data = {'cache': to_save, 'is_manual': is_manual}
-        pickle.dump(data, f)
-
-
-cache = None
-is_manual = None
-cache_changed = False
-def init():
-    global cache, is_manual
-    # TODO test
-    cache, is_manual = load_state()
-
-    if cache is not None:
+    if pd.isnull(value[prop]):
         return
 
-    # TODO maybe factor into load_state / some other check fn called there
-    # TODO maybe add to cache fn to check units of these if they are properties?
-    # TODO TODO why did i decide to do this on load? why not just do it before each addition
-    # to cache / on write?
-    # TODO TODO TODO change to checking in a wrapper of each lookup fn / similar
-    for prop, preferred_unit_str in property2preferred_units.items():
-        prop_units = ureg(preferred_unit_str)
-        prop_unit_key = f'{prop}_units'
-        #print('checking cache units for:', prop)
-        for ft, ft_cache in cache.items():
-            if prop in ft_cache.keys():
-                f2p_cache = ft_cache[prop]
-                for f, p in f2p_cache.items():
-                    assert prop in p and prop_unit_key in p
-                    # TODO delete
-                    # a crude check that the object is a pd.Series
-                    #assert hasattr(p, 'shape'), 'not a series'
-                    #
-                    assert is_series(p), 'not a series'
-
-                    if isnull(p):
-                        # TODO delete after it is clear it is equiv to my own
-                        # `isnull`
-                        # This was the old way I calculated it.
-                        assert pd.isnull(p[prop])
-                        #
-                        continue
-
-                    # TODO should it be an error for units to not be specified?
-                    # (probably, that's how i handle it in some lookup fns)
-                    # (-> so delete any entries in cache that have null units!!!)
-                    c_units = p[prop_unit_key]
-                    assert prop_units.check(c_units), f'{prop_units} != {c_units}'
-
-    # TODO TODO TODO only save if something changed (how to track? easier to wrap all
-    # writes to cache? might be a pain at this point...)
-    atexit.register(save_cache)
+    preferred_units = ureg(property2preferred_units[prop])
+    units = value[unit_key]
+    if pd.isnull(units) or not preferred_units.check(units):
+        raise ValueError(f'{prop} units {units} inconsistent with {preferred_units}')
 
 
 def allowed_kwarg(fn: Callable, kwarg_name: str) -> bool:
@@ -836,7 +945,6 @@ def allowed_kwarg(fn: Callable, kwarg_name: str) -> bool:
     )
 
 
-_nonpersistent_cache = dict()
 # TODO use this for basically every lookup fn?
 # or still let convert handle caching for some of the functions?
 # way to have it refer to the unwrapped versions in those cases?
@@ -845,75 +953,37 @@ _nonpersistent_cache = dict()
 # TODO ideally refactor so that lookup (e.g. fetching html) and parsing (of the lookup
 # output) can be separated (e.g. so we can try diff parsing strategies on cached html)
 def cached(fn):
-    # TODO TODO document what this adds (does it add ignore_cache option?)
+    """Caches outputs of lookup fn `<from_type>2<to_type>` in the persistent cache.
 
+    The input is normalized (with `normalize_id(from_type, ...)`) before the cache
+    lookup and before being passed to `fn`, so raw and normalized inputs share the same
+    cache entry. Null inputs are passed to `fn` without any caching.
+
+    Adds these kwargs to the wrapped fn:
+        ignore_cache: if True, values saved before this process are ignored (values
+            computed earlier in this process, and hardcoded values, are still used).
+
+        ignore_cache_null: if True, cached null values are re-computed.
+
+        leave_nonnull_cache: if True, null values will not overwrite cached non-null
+            values.
+    """
     # TODO TODO rename all f->from_type, t->to_type / similar
-
-    # TODO maybe modify so manual hardcoding into `properties`
-    # not required for fns referencing new "to" types?
-    # (above does this, but maybe prefer to enumerate fns rather than waiting
-    # for an add)
 
     # TODO maybe specifically only add kwargs that wrapped fn takes somehow,
     # rather than taking any kwargs, and assuming user is calling wrapped
     # fn w/ only kwargs it can take?
     # (or how to lookup kwargs of wrapped fn post hoc?)
+
+    # Would need to modify if I wanted kwargs for the decorator that explicitly
+    # specify the from / to types.
+    # https://stackoverflow.com/questions/627501
+    f, t = fn.__name__.split('2', 1)
+
     # So this cached decorator doesnt change function __name__
-    # TODO TODO TODO modify ignore_cache so it still caches calls w/ same input *within
-    # a run* (so we don't need to make a set of input IDs before applying lookup fn to a
-    # pandas series, for instance)
     @functools.wraps(fn)
     def cached_fn(key, ignore_cache=False, ignore_cache_null=False,
         leave_nonnull_cache=False, **kwargs):
-        """
-        leave_nonnull_cache: if True, null values will not overwrite
-            cached non-null values.
-        """
-        global cache_changed
-        init()
-
-        ################################################################################
-        # NOTE: moved from `cached` part before this
-        # TODO TODO TODO still work here? otherwise, need to do something else to avoid
-        # loading big cache on import
-        #
-        # Would need to modify if I wanted kwargs for the decorator that explicitly
-        # specify the from / to types.
-        # https://stackoverflow.com/questions/627501
-        f, t = fn.__name__.split('2')
-
-        #assert f in cache and t in cache[f], f'{f}->{t} not in cache'
-        # TODO maybe just handle correctly in init_cache / load_state?
-        # (would probably need to either hardcode new things to add alongside
-        # any new conversion fn defs, or enumerate types from possible conversion
-        # fn defs)
-        assert f in cache
-        if t not in cache[f]:
-            warn(f'trying to cache {fn.__name__}, but {t} not in {f} cache. adding '
-                f'empty dict for {t}.'
-            )
-            cache_changed = True
-            cache[f][t] = dict()
-        ################################################################################
-
-        np_key = (f, t, key)
-        # ignore_cache shouldn't apply to this one, as it is within each run
-        if np_key in _nonpersistent_cache:
-            return _nonpersistent_cache[np_key]
-
-        # TODO TODO fix surrounding expectations so this doesn't break stuff?
-        # don't want to have to manually create a series w/ all null keys in all those
-        # separate places ideally...
-        # (see inchi2vapor_pressure usage in vcf_scraper/make_csv.py for example where
-        # this broke something. 'vapor_pressure' column was no longer defined)
-        # TODO is this decorator also broken if fn happens to return None?
-        '''
-        if pd.isnull(key):
-            _nonpersistent_cache[np_key] = key
-            return key
-        '''
-
-        ft_cache = cache[f][t]
 
         verbose = False
         if 'verbose' in kwargs:
@@ -932,31 +1002,28 @@ def cached(fn):
                 #
                 kwargs.pop('verbose')
 
-        if not ignore_cache and key in ft_cache:
-            value = ft_cache[key]
-            # TODO maybe also support same null checking that works
-            # w/ all null series here? (currently just using for single elements
-            # where chemspider id is null though...) (comment is probably no
-            # longer relevant now that i'm using my own `isnull`, but check more
-            # closely)
-            if not ignore_cache_null or isnull(value):
-                if verbose:
-                    print(f"{fn.__name__}('{key}') returning {value} "
-                        "from cache"
-                    )
-                return value
+        if isnull(key):
+            return fn(key, **kwargs)
+
+        key = normalize_id(f, key)
+        if isnull(key):
+            return fn(key, **kwargs)
+
+        value = _cache_get(f, t, key, session_only=ignore_cache)
+        if value is not _missing and not (ignore_cache_null and isnull(value)):
+            if verbose:
+                print(f"{fn.__name__}('{key}') returning {value} from cache")
+            return value
 
         value = fn(key, **kwargs)
 
-        _nonpersistent_cache[np_key] = value
+        if leave_nonnull_cache and isnull(value):
+            cached_value = _cache_get(f, t, key)
+            if cached_value is not _missing and not isnull(cached_value):
+                return value
 
-        # TODO clean this conditional up
-        # TODO + test it
-        if not (leave_nonnull_cache and isnull(value) and
-            key in ft_cache and not isnull(ft_cache[key])):
-            cache_changed = True
-            ft_cache[key] = value
-
+        _check_property_value(t, value)
+        _cache_set(f, t, key, value)
         return value
 
     return cached_fn
@@ -1153,21 +1220,29 @@ cid2compound_cache = dict()
 # used no matter what
 def convert(chem_id, from_type=None, to_type='inchi', *, verbose: bool = False,
     allow_nan: bool = False, allow_conflicts: bool = True, ignore_cache: bool = False,
-    exclude_cols=tuple(), already_normalized: bool = False, dropna: bool = True,
+    exclude_cols=tuple(), dropna: bool = True,
     report_missing: bool = True, report_conflicts: bool = True,
     try_non_normalized: bool = True, check_one2one: bool = False,
     keep_originals: bool = False, orig_prefix: str = 'orig_'):
     """
+    Input IDs are always normalized (with `normalize_<from_type>`, if defined) before
+    cache lookup, and values are cached under the normalized ID, so raw and normalized
+    inputs share the same cache entries.
+
     Args:
         dropna: whether to drop input subset where lookups fail (if setting this to
             False, probably want `allow_nan=True`)
 
         allow_nan: whether to err if any lookups fail (does not depend on
             `dropna=False`)
-    """
-    global cache_changed
-    init()
 
+        ignore_cache: if True, values saved before this process are ignored (values
+            looked up earlier in this process, and hardcoded values, are still used).
+            If 'if_null', cached null values are looked up again.
+
+        try_non_normalized: if lookup of the normalized ID fails, also try looking up
+            the input ID as passed (result is still cached under the normalized ID).
+    """
     def conversion_fail_errmsg():
         return f'conversion from {from_type} to {to_type} failed for'
 
@@ -1224,7 +1299,7 @@ def convert(chem_id, from_type=None, to_type='inchi', *, verbose: bool = False,
             # lookups.
             fn = lambda x: convert(x, from_type=from_type, to_type=to_type,
                 verbose=verbose, ignore_cache=ignore_cache, allow_nan=True,
-                already_normalized=already_normalized, report_missing=False
+                report_missing=False
             )
 
             # TODO test each of these cases
@@ -1297,7 +1372,6 @@ def convert(chem_id, from_type=None, to_type='inchi', *, verbose: bool = False,
                 'allow_nan': allow_nan,
                 'ignore_cache': ignore_cache,
                 'dropna': dropna,
-                'already_normalized': already_normalized,
                 'report_missing': report_missing,
                 'verbose': verbose
             }
@@ -1335,7 +1409,6 @@ def convert(chem_id, from_type=None, to_type='inchi', *, verbose: bool = False,
             if not converted_an_index:
                 kwargs['allow_nan'] = True
                 kwargs['dropna'] = False
-                kwargs['already_normalized'] = True
                 kwargs['report_missing'] = False
 
                 attempts = dict()
@@ -1473,15 +1546,12 @@ def convert(chem_id, from_type=None, to_type='inchi', *, verbose: bool = False,
 
     # TODO unit test each of these cases, including None handling
 
-    # TODO caching that can also short circuit this step? use same cache?
-    # (seems to be taking up most of time in odor2abbrev case)
+    # Cache keys are always normalized IDs (and normalization is idempotent), so raw
+    # and normalized inputs share the same cache entries.
     old_chem_id = chem_id
-    if not already_normalized:
-        norm_fn_name = 'normalize_' + from_type
-        if norm_fn_name in globals():
-            chem_id = globals()[norm_fn_name](chem_id)
-            if verbose and old_chem_id != chem_id:
-                print(f'{norm_fn_name}({old_chem_id}) -> {chem_id}')
+    chem_id = normalize_id(from_type, chem_id)
+    if verbose and old_chem_id != chem_id:
+        print(f'normalize_{from_type}({old_chem_id}) -> {chem_id}')
 
     # Since sometimes (just normalize_cas, for now) normalize fns can return
     # null.
@@ -1493,73 +1563,30 @@ def convert(chem_id, from_type=None, to_type='inchi', *, verbose: bool = False,
     # direction is filled (CID <-> inchi? definitely inchikey <-> inchi, right?)
     # ...and do they have to be 1:1?
 
-    #if not ignore_cache:
-    #if ignore_cache == False or ignore_cache == 'if_null':
-    if ignore_cache != True:
-        # TODO should this fail into elif if cached value is None?
-        # (be consistent w/ all branches on try_non_normalized)
-        if chem_id in cache[from_type][to_type]:
-            val = cache[from_type][to_type][chem_id]
-            # TODO need other handling of ignore_cache == False case?
-            if not (ignore_cache == 'if_null' and pd.isnull(val)):
-                if verbose:
-                    print(f'returning {val} from cache')
-                return val
+    # ignore_cache=True still uses values looked up earlier in this process.
+    session_only = ignore_cache == True
 
-        elif try_non_normalized and old_chem_id in cache[from_type][to_type]:
-            val = cache[from_type][to_type][old_chem_id]
-            # TODO need other handling of ignore_cache == False case?
-            if not (ignore_cache == 'if_null' and pd.isnull(val)):
-                if verbose:
-                    # TODO here and in other similar places, replace
-                    # 'chem_id' w/ value of `from_type`
-                    print('falling back to non-normalized chem_id')
-                    print(f'returning {val} from cache')
-                return val
+    val = _cache_get(from_type, to_type, chem_id, session_only=session_only)
+    if val is not _missing and not (ignore_cache == 'if_null' and isnull(val)):
+        if verbose:
+            print(f'returning {val} from cache')
+        return val
 
-    # Added 2020-06-25 as part of trying to add ignore_cache == 'if_null'
-    # support.
-    if from_type.lower() != 'cid':
-        cid = None
-    else:
-        # TODO have next conditionals skipped in this branch anyway?
+    if from_type == 'cid':
         cid = chem_id
+    else:
+        cid = _cache_get(from_type, 'cid', chem_id, session_only=session_only)
+        if cid is not _missing:
+            if verbose:
+                print(f'{chem_id} of type {from_type} had CID {cid} in cache')
 
-    #if not ignore_cache and chem_id in cache[from_type]['cid']:
-    if ignore_cache != True and chem_id in cache[from_type]['cid']:
-        cid = cache[from_type]['cid'][chem_id]
-        if verbose:
-            print(f'{chem_id} of type {from_type} had CID {cid} in cache')
-
-        if cid is None:
-            if ignore_cache != 'if_null':
+            if isnull(cid) and ignore_cache != 'if_null':
                 if verbose:
                     print('CID in cache was None!')
                 conversion_fail_err()
                 return None
 
-    #elif (not ignore_cache and try_non_normalized and
-    elif (ignore_cache != True and try_non_normalized and
-        old_chem_id in cache[from_type]['cid']):
-
-        cid = cache[from_type]['cid'][old_chem_id]
-        if verbose:
-            print('falling back to non-normalized chem_id')
-            print(f'{old_chem_id} of type {from_type} had CID {cid} in cache')
-
-        if cid is None:
-            # TODO could probably handle this once below in `if cid is None`
-            # case, rather than here and in `if` above...
-            if ignore_cache != 'if_null':
-                if verbose:
-                    print('CID in cache was None!')
-                conversion_fail_err()
-                return None
-
-    # Changed 2020-06-25 as part of trying to add ignore_cache == 'if_null'
-    # support.
-    #else:
-    if cid is None:
+    if cid is _missing or isnull(cid):
         f2cid_fn_name = from_type + '2cid'
 
         if f2cid_fn_name not in globals():
@@ -1579,30 +1606,30 @@ def convert(chem_id, from_type=None, to_type='inchi', *, verbose: bool = False,
             if verbose:
                 print(f'looking up CID for {chem_id} of type {from_type} failed!')
 
-            if try_non_normalized:
+            if try_non_normalized and old_chem_id != chem_id:
                 if verbose:
                     print('falling back to non-normalized chem_id')
                 cid = globals()[f2cid_fn_name](old_chem_id)
 
-        if cid is None:
-            if try_non_normalized and verbose:
-                print(f'looking up CID for {old_chem_id} of type {from_type} failed!')
+                if cid is None and verbose:
+                    print(f'looking up CID for {old_chem_id} of type {from_type} '
+                        'failed!'
+                    )
 
+        if cid is None:
             for tt in chem_id_types:
-                to_type_cache = cache[from_type][tt]
-                # To not overwrite hardcoded values for other types.
-                if chem_id not in to_type_cache:
-                    cache_changed = True
-                    to_type_cache[chem_id] = None
+                # To not overwrite existing (e.g. hardcoded) values for other types.
+                if _cache_get(from_type, tt, chem_id) is _missing:
+                    _cache_set(from_type, tt, chem_id, None)
 
             conversion_fail_err()
             return None
 
+        cid = normalize_cid(cid)
         if verbose:
             print(f'CID={cid}')
 
-        cache_changed = True
-        cache[from_type]['cid'][chem_id] = cid
+        _cache_set(from_type, 'cid', chem_id, cid)
 
     # TODO TODO should i also support some way of directly going from from_type
     # to to_type, w/o requiring a set of fns about a Compound intermediate?
@@ -1611,42 +1638,25 @@ def convert(chem_id, from_type=None, to_type='inchi', *, verbose: bool = False,
     # TODO way to go direct to Compound?
     # (__init__ takes something called a "record dict from the PubChem PUG REST
     # service", which we might already have in the results...) idk...
-    # TODO TODO TODO possible to cache this? Compounds pickleable?
 
-    if 'compound' not in cache['cid']:
-        cache_changed = True
-        cache['cid']['compound'] = dict()
-
-    elif cid in cache['cid']['compound']:
+    compound = _cache_get('cid', 'compound', cid)
+    if compound is not _missing:
         # TODO delete
         if verbose:
             print('using cid->compound cache')
         #
-        compound = cache['cid']['compound'][cid]
-
     else:
         # TODO delete
         if verbose:
             print('NOT using cid->compound cache')
         #
 
-        # TODO delete
         t0 = time.time()
-        #
-
         compound = pcp.Compound.from_cid(cid)
+        if verbose:
+            print(f'pcp.Compound.from_cid({cid}) took {(time.time() - t0):.3f}s')
 
-        # TODO delete
-        print(f'pcp.Compound.from_cid({cid}) took {(time.time() - t0):.3f}s')
-        #import ipdb; ipdb.set_trace()
-        #
-
-        # TODO delete???
-        # TODO this being saved by atexit?
-        cache_changed = True
-        cache['cid']['compound'][cid] = compound
-        #
-
+        _cache_set('cid', 'compound', cid, compound)
 
     if compound is None:
         # TODO should i just assert false here or something?
@@ -1654,16 +1664,12 @@ def convert(chem_id, from_type=None, to_type='inchi', *, verbose: bool = False,
             print(f'creating Compound from CID {cid} failed!')
 
         for tt in chem_id_types:
-            # TODO if we didn't need this though, we could factor this into a fn
-            # and use both here and above in cid == None case...
             # Just because we technically did get a non-null cid before.
             if tt == 'cid':
                 continue
-            to_type_dict = cache[from_type][tt]
-            # To not overwrite hardcoded values for other types.
-            if chem_id not in to_type_dict:
-                cache_changed = True
-                to_type_dict[chem_id] = None
+            # To not overwrite existing (e.g. hardcoded) values for other types.
+            if _cache_get(from_type, tt, chem_id) is _missing:
+                _cache_set(from_type, tt, chem_id, None)
 
         conversion_fail_err()
         return None
@@ -1684,8 +1690,10 @@ def convert(chem_id, from_type=None, to_type='inchi', *, verbose: bool = False,
     else:
         to_type_val = compound2t_fn(compound)
 
-    cache_changed = True
-    cache[from_type][to_type][chem_id] = to_type_val
+    if to_type == 'cid':
+        to_type_val = normalize_cid(to_type_val)
+
+    _cache_set(from_type, to_type, chem_id, to_type_val)
 
     if verbose and to_type_val is None:
         print(f'conversion of {chem_id} from Compound to {to_type} failed!')
@@ -1694,12 +1702,48 @@ def convert(chem_id, from_type=None, to_type='inchi', *, verbose: bool = False,
     return to_type_val
 
 
+def normalize_id(chem_id_type: str, chem_id):
+    """Returns `chem_id` normalized with `normalize_<chem_id_type>`, if defined.
+
+    All normalization fns are idempotent and return null for null input.
+    """
+    if chem_id_type in equivalent_col_names:
+        chem_id_type = equivalent_col_names[chem_id_type]
+
+    norm_fn = globals().get(f'normalize_{chem_id_type}')
+    if norm_fn is None:
+        return chem_id
+
+    return norm_fn(chem_id)
+
+
+# E/Z stereo descriptors (e.g. '(e)-', '(e,z)-'), which normalize_name keeps uppercase,
+# despite lowercasing everything else.
+_ez_descriptor_re = re.compile(r'\(([ez](?:,[ez])*)\)-')
+
 def normalize_name(name):
     # TODO maybe remove first null check in convert if this is the expected
     # behavior of the norm fns?
     if pd.isnull(name):
         return name
 
+    return _normalize_name(name)
+
+
+@functools.lru_cache(maxsize=2**16)
+def _normalize_name(name: str) -> Optional[str]:
+    # Repeating until output stops changing, so that normalize_name is idempotent.
+    for _ in range(10):
+        normed_name = _normalize_name_once(name)
+        if normed_name is None or normed_name == name:
+            return normed_name
+        name = normed_name
+
+    warn(f'normalize_name did not converge for {name!r}')
+    return name
+
+
+def _normalize_name_once(name: str) -> Optional[str]:
     # TODO don't lowercase letters appearing by themselves?
     name = name.replace('(CAS)', '').strip().lower()
 
@@ -1732,8 +1776,11 @@ def normalize_name(name):
         return None
 
     for a, b in zip(parts, parts[1:]):
-        # We don't want to join adjacent words, or after comma.
-        if a[-1] == ',' or (a[-1].isalpha() and b[0].isalpha()):
+        # Only joining across a hyphen (e.g. 'a -pinene' -> 'a-pinene'), and never
+        # after a comma. Joining in other cases changed which compound some names refer
+        # to (e.g. 'ethyl 3-hydroxyhexanoate' -> 'ethyl3-hydroxyhexanoate', which
+        # PubChem resolves to a different CID).
+        if a[-1] == ',' or not (a[-1] == '-' or b[0] == '-'):
             b = ' ' + b
         normed_name += b
 
@@ -1791,6 +1838,9 @@ def normalize_name(name):
             normed_name = c(normed_name)
             print(f'applying correction {c.__name__} to get {normed_name}.')
 
+    # So '(E)-'/'(Z)-' (from corrections above, or in input) are not lowercased.
+    normed_name = _ez_descriptor_re.sub(lambda m: m.group(0).upper(), normed_name)
+
     return normed_name
 
 
@@ -1812,6 +1862,75 @@ def normalize_cas(cas):
         return None
 
     return normed_cas
+
+
+def _strip_prefix(chem_id: str, prefix: str) -> str:
+    """Strips whitespace and (any number of repeats of) case-insensitive `prefix`.
+    """
+    chem_id = chem_id.strip()
+    while chem_id.lower().startswith(prefix.lower()):
+        chem_id = chem_id[len(prefix):].strip()
+    return chem_id
+
+
+def normalize_inchi(inchi):
+    """Returns InChI without whitespace or 'InChI=' prefix (as used in cache).
+
+    >>> normalize_inchi('InChI=1S/CH4/h1H4')
+    '1S/CH4/h1H4'
+    """
+    if pd.isnull(inchi):
+        return inchi
+
+    inchi = _strip_prefix(inchi, 'InChI=')
+    if len(inchi) == 0:
+        return None
+
+    return inchi
+
+
+def normalize_inchikey(inchikey):
+    """Returns uppercase InChIKey without whitespace or 'InChIKey=' prefix.
+    """
+    if pd.isnull(inchikey):
+        return inchikey
+
+    inchikey = _strip_prefix(inchikey, 'InChIKey=').upper()
+    if len(inchikey) == 0:
+        return None
+
+    return inchikey
+
+
+def normalize_cid(cid) -> Optional[int]:
+    """Returns PubChem compound ID as an int (e.g. from float in Series w/ NaN).
+
+    >>> normalize_cid(6654.0)
+    6654
+    """
+    if pd.isnull(cid):
+        return cid
+
+    if isinstance(cid, str):
+        cid = float(cid.strip())
+
+    int_cid = int(cid)
+    if int_cid != cid:
+        raise ValueError(f'CID must be an integer. got: {cid!r}')
+
+    return int_cid
+
+
+def normalize_smiles(smiles):
+    """Returns SMILES without surrounding whitespace."""
+    if pd.isnull(smiles):
+        return smiles
+
+    smiles = smiles.strip()
+    if len(smiles) == 0:
+        return None
+
+    return smiles
 
 
 pubchem_root_url = 'https://pubchem.ncbi.nlm.nih.gov'
@@ -1960,7 +2079,7 @@ def inchikey2cid(inchikey, verbose=False):
 
 
 def inchi2cid(inchi, verbose=False):
-    inchi = 'InChI=' + inchi
+    inchi = 'InChI=' + normalize_inchi(inchi)
     try:
         results = pcp.get_compounds(inchi, 'inchi')
     except urllib.error.URLError as e:
@@ -1971,6 +2090,11 @@ def inchi2cid(inchi, verbose=False):
 
 
 def compound2cid(compound: Compound) -> int:
+    """Returns PubChem compound ID.
+
+    PubChem has separate CIDs for each stereoisomer (and another for the compound with
+    stereochemistry unspecified), so the CID does reflect stereochemistry.
+    """
     return compound.cid
 
 
@@ -1979,11 +2103,21 @@ def compound2cid(compound: Compound) -> int:
 # name (as long as it doesn't depend on how the page is accessed...).
 # e.g. 'linalool' vs IUPAC '3,7-dimethylocta-1,6-dien-3-ol'
 def compound2name(compound: Compound) -> str:
+    """Returns PubChem's preferred IUPAC name.
+
+    Includes stereochemistry, when defined (e.g. '(E)-hex-2-enal' for CID 5281168).
+    """
     # TODO use name displayed on pubchem page (accessible thru pubchempy?)?
     return compound.iupac_name
 
 
 def compound2inchi(compound: Compound) -> str:
+    """Returns standard InChI, without the 'InChI=' prefix.
+
+    Includes stereochemistry layers (/b, /t, /m, /s), when defined (e.g.
+    '1S/C6H10O/c1-2-3-4-5-6-7/h4-6H,2-3H2,1H3/b5-4+' for CID 5281168). See
+    `basic_inchi(..., no_stereochem=True)` to remove them.
+    """
     inchi = compound.inchi
     # TODO sometimes, is it just the prefix?
     assert inchi.startswith('InChI=')
@@ -1994,10 +2128,21 @@ def compound2inchi(compound: Compound) -> str:
 
 
 def compound2inchikey(compound: Compound) -> str:
+    """Returns standard InChIKey.
+
+    Includes stereochemistry, when defined, as it is a hash of the full standard InChI
+    (the second block is 'UHFFFAOYSA' when there are no stereochemistry or other
+    non-connectivity layers).
+    """
     return compound.inchikey
 
 
 def compound2cas(compound: Compound, *, verbose: bool = False) -> Optional[str]:
+    """Returns first CAS number in PubChem synonyms (None if there are none).
+
+    CAS numbers are assigned per substance, so may or may not be specific to one
+    stereoisomer (some PubChem compounds also list CAS numbers for other forms).
+    """
     cas_numbers = [
         x for x in compound.synonyms if re.match(r'(\d{2,7}-\d\d-\d)', x)
     ]
@@ -2025,8 +2170,44 @@ def compound2cas(compound: Compound, *, verbose: bool = False) -> Optional[str]:
     return cas
 
 
-def compound2smiles(compound):
-    return compound.canonical_smiles
+def _compound_smiles(compound: Compound, names) -> Optional[str]:
+    """Returns value of first SMILES property of `compound` with name in `names`.
+
+    Reading record directly (rather than via pubchempy attributes), since PubChem renamed
+    its SMILES properties in 2025, and records saved before only have the old names.
+    """
+    smiles_props = {p['urn'].get('name'): p['value']['sval']
+        for p in compound.record.get('props', []) if p['urn'].get('label') == 'SMILES'
+    }
+    for name in names:
+        if name in smiles_props:
+            return smiles_props[name]
+
+    return None
+
+
+def compound2smiles(compound: Compound) -> Optional[str]:
+    """Returns PubChem SMILES *without* stereochemistry (or isotope) information.
+
+    Only describes connectivity, so all stereoisomers of a compound have the same value
+    (e.g. 'CCCC=CC=O' for CID 5281168, (E)-2-hexenal). See `compound2isomeric_smiles`
+    for SMILES with stereochemistry.
+
+    PubChem calls this the "Connectivity" SMILES ("Canonical" before 2025).
+    """
+    return _compound_smiles(compound, ('Connectivity', 'Canonical'))
+
+
+def compound2isomeric_smiles(compound: Compound) -> Optional[str]:
+    """Returns PubChem SMILES *with* stereochemistry (and isotope) information.
+
+    E.g. 'CCC/C=C/C=O' for CID 5281168, (E)-2-hexenal. Same as `compound2smiles` output
+    for compounds without defined stereochemistry. Available as
+    `convert(..., to_type='isomeric_smiles')`.
+
+    PubChem calls this the "Absolute" SMILES ("Isomeric" before 2025).
+    """
+    return _compound_smiles(compound, ('Absolute', 'Isomeric'))
 
 
 # TODO doc (/ better name). what is this for (only used in natural_odors/odors.py)?
@@ -2154,6 +2335,7 @@ def chemspider_experimental_density(csid, verbose=False):
 
 nist_url_prefix = 'http://webbook.nist.gov'
 def inchi2nist_webbook_url(inchi):
+    inchi = normalize_inchi(inchi)
     # TODO replace w/ general url escaping library call? stdlib?
     inchi_str = 'InChI=' + inchi.replace('/','%2F').replace(',','%2C').replace(
         '+', '%2B'
@@ -3209,7 +3391,8 @@ def inchi2nist_k_henry(inchi, verbose=False):
     # TODO test in case where there shouldn't be any tables
     #dfs = pd.read_html(url,
     try:
-        dfs = pd.read_html(response.text,
+        # (pandas>=3 requires literal HTML be wrapped in StringIO)
+        dfs = pd.read_html(StringIO(response.text),
             attrs={'aria-label': "Henry's Law constant (water solution)"}
         )
 
@@ -3512,7 +3695,8 @@ def inchi2maxplanck_k_henry(inchi, verbose=False):
     response = session.get(url)
     html = response.text
 
-    dfs = pd.read_html(html)
+    # (pandas>=3 requires literal HTML be wrapped in StringIO)
+    dfs = pd.read_html(StringIO(html))
 
     # Looking for one DataFrame with an index like this:
     # [MultiIndex([(                  'Hscp',       '[mol/(m3Pa)]'),
@@ -3927,9 +4111,7 @@ def add_properties_to_cache(df, overwrite_close=False, dropna=True,
     verbose=False):
     """Adds chemical properties in `df` to cache under 'inchi'.
     """
-    global cache_changed
-    global cache, is_manual
-    init()
+    df = df.assign(inchi=df.inchi.map(normalize_inchi))
 
     # So we don't have to check whether values behind each instance
     # of same inchi are consistent.
@@ -3942,7 +4124,6 @@ def add_properties_to_cache(df, overwrite_close=False, dropna=True,
         if prop in df.columns:
             preferred_unit_str = property2preferred_units[prop]
             preferred_units = ureg(preferred_unit_str)
-            inchi2prop_cache = cache['inchi'][prop]
             # TODO this work? test
             def add_to_cache(i, p, row):
                 nonlocal add_count
@@ -3965,12 +4146,7 @@ def add_properties_to_cache(df, overwrite_close=False, dropna=True,
                 if pd.isnull(getattr(row, f'{prop}_sources')):
                     raise ValueError(f'{row.Index} {prop} missing source')
 
-                inchi2prop_cache[i] = new_entry
-                key = ('inchi', prop, i)
-                if key not in is_manual or is_manual[key] != True:
-                    cache_changed = True
-
-                is_manual[key] = True
+                _cache_set('inchi', prop, i, new_entry, manual=True)
                 add_count += 1
             #
 
@@ -3988,7 +4164,7 @@ def add_properties_to_cache(df, overwrite_close=False, dropna=True,
                 # TODO TODO maybe change so that i can more easily clear things
                 # already entered (by deleting that row in spreadsheet and
                 # re-adding) (delete existing stuff in cache if valueerror,
-                # before raising (and if `is_manual` is True for it)?)
+                # before raising (and if it was manually entered)?)
 
                 # TODO for all these errors, try to use name rather than inchi
                 # (at least if available)
@@ -4018,37 +4194,29 @@ def add_properties_to_cache(df, overwrite_close=False, dropna=True,
                 q = (m * ureg(unit_str)).to(preferred_unit_str).magnitude
 
                 inchi = row.Index
-                if inchi not in inchi2prop_cache:
+                cached_value = _cache_get('inchi', prop, inchi)
+                if cached_value is _missing:
                     if verbose:
                         print(f'adding {inchi} not already in cache')
-                    #inchi2prop_cache[inchi] = new_entry
-                    #add_count += 1
                     add_to_cache(inchi, q, row)
                     continue
 
-                # TODO replace w/ isnull(inchi2prop_cache[inchi]), or no?
-                if pd.isnull(inchi2prop_cache[inchi][prop]):
+                if isnull(cached_value) or pd.isnull(cached_value[prop]):
                     if verbose:
                         print(f'adding {inchi} null in cache')
                     add_to_cache(inchi, q, row)
+                    continue
 
-                if not np.isclose(inchi2prop_cache[inchi][prop], q):
+                if not np.isclose(cached_value[prop], q):
                     if verbose:
                         print(f'adding {inchi} b/c not close to cache value')
                     add_to_cache(inchi, q, row)
-                    #inchi2prop_cache[inchi] = new_entry
-                    #add_count += 1
                 else:
                     if verbose:
                         print(f'not adding {inchi} b/c close to cache value')
 
     if add_count == 0:
         print('Nothing new found to add to cache.')
-
-    # So that calls clearing cache before atexit trigger / problems with
-    # atexit trigger do not prevent these values from being saved.
-    # TODO want merge_with_saved=False here? (may not)
-    save_cache()
 
 
 _odor_inventory_gsheet = None
