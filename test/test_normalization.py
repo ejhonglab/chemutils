@@ -5,6 +5,7 @@ import pandas as pd
 import pytest
 
 import chemutils as cu
+from test_cache import ethyl_acetate
 
 
 # Including inputs that (some versions of) normalize_name handled incorrectly.
@@ -35,6 +36,8 @@ name2normalized = {
     # Old normalize_name was not idempotent for these
     'x (abcd) (efgh)': 'x',
     'ethyl ester hexanoic acid': 'hexanoic acid, ethyl ester',
+    # Prefix correction needed after ester/acid reordering
+    'ethyl ester g-hydroxybutyric acid': 'gamma-hydroxybutyric acid, ethyl ester',
     '(1S)-(+)-3-carene': '(1s)-(+)-3-carene',
 }
 
@@ -44,10 +47,9 @@ def test_normalize_name(name, expected):
 
 
 def hardcoded_names():
-    names = set()
-    for tts in [cu.hardcoded['name']] + [{'': cu.hardcoded_type2null_keys['name']}]:
-        for keys in tts.values():
-            names.update(keys)
+    names = set(cu.hardcoded_type2null_keys['name'])
+    for f2t_dict in cu.hardcoded['name'].values():
+        names.update(f2t_dict)
     return sorted(names)
 
 
@@ -59,8 +61,8 @@ def test_normalize_name_idempotent(name):
     assert cu.normalize_name(normed) == normed
 
 
-inchi = '1S/C4H8O2/c1-3-6-4(2)5/h3H2,1-2H3'
-inchikey = 'XEKOWRVHYACXOJ-UHFFFAOYSA-N'
+inchi = ethyl_acetate['inchi']
+inchikey = ethyl_acetate['inchikey']
 
 # chem_id_type -> list of (raw input, expected normalized)
 type2cases = {

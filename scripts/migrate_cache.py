@@ -45,10 +45,6 @@ import pandas as pd
 import chemutils as cu
 
 
-# Types whose values (not just keys) are normalized while migrating.
-normalized_value_types = ('cid', 'inchi', 'inchikey', 'cas')
-
-
 @dataclass
 class Entry:
     from_type: str
@@ -56,12 +52,6 @@ class Entry:
     raw_key: object
     value: object
     manual: bool = False
-
-
-def _quiet(fn, *args):
-    # (normalize_name prints when applying some corrections)
-    with contextlib.redirect_stdout(io.StringIO()):
-        return fn(*args)
 
 
 def old_normalize_name(name) -> Optional[str]:
@@ -128,23 +118,6 @@ def load_pickle_cache(path):
     return data['cache'], is_manual
 
 
-def _hardcoded_raw_entries():
-    """Returns {(from_type, to_type, raw key): value} the old cache added from hardcoded.
-    """
-    entries = dict()
-    for ft, null_keys in cu.hardcoded_type2null_keys.items():
-        for k in null_keys:
-            for tt in cu.chem_id_types:
-                entries[(ft, tt, k)] = None
-
-    for ft, tts in cu.hardcoded.items():
-        for tt, f2t_dict in tts.items():
-            for k, v in f2t_dict.items():
-                entries[(ft, tt, k)] = v
-
-    return entries
-
-
 def _drop_old_name_normalization_artifacts(entries, report):
     name2entries = defaultdict(dict)
     for e in entries:
@@ -155,7 +128,7 @@ def _drop_old_name_normalization_artifacts(entries, report):
     to_drop = set()
     for raw, raw_entries in name2entries.items():
         try:
-            old_normed = _quiet(old_normalize_name, raw)
+            old_normed = old_normalize_name(raw)
         # (old fn raised this for some inputs, so they can't have been added by it)
         except IndexError:
             continue
@@ -164,8 +137,7 @@ def _drop_old_name_normalization_artifacts(entries, report):
             continue
 
         # Keys that now normalize the same are merged later instead.
-        if (_quiet(cu.normalize_name, raw) ==
-            _quiet(cu.normalize_name, old_normed)):
+        if cu.normalize_name(raw) == cu.normalize_name(old_normed):
             continue
 
         report['old_normalization_artifacts'].append((raw, old_normed))
@@ -234,8 +206,16 @@ def plan_migration(old_cache, old_is_manual):
 
     `report` is a dict of category -> list of details (see `print_report`).
     """
+    # (normalize_name prints when applying some corrections)
+    with contextlib.redirect_stdout(io.StringIO()):
+        return _plan_migration(old_cache, old_is_manual)
+
+
+def _plan_migration(old_cache, old_is_manual):
     report = defaultdict(list)
-    hardcoded = _hardcoded_raw_entries()
+    report['n_input'] = sum(len(f2t) for tts in old_cache.values()
+        for f2t in tts.values()
+    )
 
     entries = []
     for ft, tts in old_cache.items():
@@ -245,38 +225,34 @@ def plan_migration(old_cache, old_is_manual):
                     report['null_key_dropped'].append((ft, tt, k))
                     continue
 
-                if (ft, tt, k) in hardcoded and cu._values_equal(
-                    hardcoded[(ft, tt, k)], v):
-
-                    report['hardcoded_dropped'].append((ft, tt, k))
-                    continue
-
                 manual = bool(old_is_manual.get((ft, tt, k), False))
                 entries.append(Entry(ft, tt, k, v, manual))
 
-    report['n_input'] = len(entries) + len(report['null_key_dropped']) + len(
-        report['hardcoded_dropped']
-    )
-
     entries = _drop_old_name_normalization_artifacts(entries, report)
 
+    hardcoded = cu._get_hardcoded()
     groups = defaultdict(list)
     for e in entries:
-        key = _quiet(cu.normalize_id, e.from_type, e.raw_key)
+        key = cu.normalize_id(e.from_type, e.raw_key)
         if cu.isnull(key):
             report['null_normalized_key_dropped'].append(
                 (e.from_type, e.to_type, e.raw_key)
             )
             continue
 
-        if _quiet(cu.normalize_id, e.from_type, key) != key:
+        if cu.normalize_id(e.from_type, key) != key:
             report['non_idempotent'].append((e.from_type, e.raw_key, key))
+
+        e.value = cu._normalize_value(e.to_type, e.value)
+
+        # Hardcoded values are applied separately (taking precedence over cache).
+        hardcoded_f2t = hardcoded.get((e.from_type, e.to_type), dict())
+        if key in hardcoded_f2t and cu._values_equal(hardcoded_f2t[key], e.value):
+            report['hardcoded_dropped'].append((e.from_type, e.to_type, e.raw_key))
+            continue
 
         if key != e.raw_key:
             report['rekeyed'].append((e.from_type, e.to_type, e.raw_key, key))
-
-        if e.to_type in normalized_value_types and not cu.isnull(e.value):
-            e.value = cu.normalize_id(e.to_type, e.value)
 
         groups[(e.from_type, e.to_type, key)].append(e)
 
@@ -371,12 +347,12 @@ def write_db(db_path, resolved, *, updated: float, force: bool = False) -> None:
             )
 
         rows = [
-            (ft, tt, key, cu._encode_value(e.value), int(e.manual), updated)
+            cu._entry_row(ft, tt, key, e.value, manual=e.manual, updated=updated)
             for (ft, tt, key), e in resolved.items()
         ]
         conn.execute('BEGIN')
         conn.execute('DELETE FROM entries')
-        conn.executemany('INSERT INTO entries VALUES (?, ?, ?, ?, ?, ?)', rows)
+        conn.executemany(cu._insert_entry_sql, rows)
         conn.execute('COMMIT')
     finally:
         conn.close()
@@ -387,8 +363,7 @@ def verify_db(db_path, resolved) -> None:
     """
     conn = cu._connect(db_path)
     try:
-        rows = conn.execute('SELECT from_type, to_type, key, value, manual FROM entries'
-            ).fetchall()
+        rows = list(cu._iter_entries(conn))
     finally:
         conn.close()
 
@@ -399,7 +374,7 @@ def verify_db(db_path, resolved) -> None:
 
     for ft, tt, key, value, manual in rows:
         e = resolved[(ft, tt, key)]
-        if not cu._values_equal(cu._decode_value(value), e.value):
+        if not cu._values_equal(value, e.value):
             raise ValueError(f'{(ft, tt, key)} value in {db_path} does not match '
                 f'expected {e.value!r}'
             )

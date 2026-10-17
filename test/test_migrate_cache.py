@@ -3,13 +3,12 @@
 import importlib.util
 from pathlib import Path
 import pickle
-import sqlite3
 
 import pandas as pd
 import pytest
 
 import chemutils as cu
-from test_cache import ethyl_acetate, make_compound, pubchem
+from test_cache import db_entries, ethyl_acetate, make_compound, new_process, pubchem
 
 
 script = Path(__file__).resolve().parents[1] / 'scripts' / 'migrate_cache.py'
@@ -81,14 +80,6 @@ def old_pickle(tmp_path):
     return path
 
 
-def db_entries():
-    conn = sqlite3.connect(cu.cache_path())
-    rows = conn.execute('SELECT from_type, to_type, key, value, manual FROM entries'
-        ).fetchall()
-    conn.close()
-    return {(ft, tt, k): (cu._decode_value(v), m) for ft, tt, k, v, m in rows}
-
-
 def test_migrate(old_pickle, pubchem):
     pickle_bytes = old_pickle.read_bytes()
 
@@ -123,7 +114,7 @@ def test_migrate(old_pickle, pubchem):
     assert not any(k is None for _, _, k in entries)
 
     pubchem.fail = True
-    cu._reset_cache_state()
+    new_process()
 
     name2cid = {
         'hexyl 2-methylbutanoate': 24838,
@@ -164,7 +155,7 @@ def test_migrate_dry_run(old_pickle):
 
 def test_migrate_existing(old_pickle):
     cu.cache['name']['cid']['x'] = 1
-    cu._reset_cache_state()
+    new_process()
 
     with pytest.raises(RuntimeError, match='--force'):
         migrate_cache.migrate(old_pickle, cu.cache_path(), verbose=False)

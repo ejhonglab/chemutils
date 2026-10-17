@@ -7,7 +7,10 @@ Each test uses a new, empty cache (see `chemutils_test_cache` in ../conftest.py)
 come from the saved cache.
 """
 
+import os
 import sqlite3
+import subprocess
+import sys
 
 import numpy as np
 import pandas as pd
@@ -126,18 +129,27 @@ def pubchem(monkeypatch):
     return fake
 
 
-def db_rows(from_type, to_type):
-    """Returns {key: decoded value} saved in cache database (bypassing chemutils).
+def db_entries(from_type=None, to_type=None):
+    """Returns {(from_type, to_type, key): (value, manual)} saved in cache database.
+
+    Uses a separate connection, so nothing comes from chemutils' in-memory cache.
     """
     if not cu.cache_path().exists():
         return dict()
 
     conn = sqlite3.connect(cu.cache_path())
-    rows = conn.execute('SELECT key, value FROM entries WHERE from_type = ? AND '
-        'to_type = ?', (from_type, to_type)
-    ).fetchall()
-    conn.close()
-    return {k: cu._decode_value(v) for k, v in rows}
+    try:
+        return {(ft, tt, k): (v, m)
+            for ft, tt, k, v, m in cu._iter_entries(conn, from_type, to_type)
+        }
+    finally:
+        conn.close()
+
+
+def db_rows(from_type, to_type):
+    """Returns {key: value} saved in cache database, for one conversion.
+    """
+    return {k: v for (_, _, k), (v, _) in db_entries(from_type, to_type).items()}
 
 
 def new_process():
@@ -452,6 +464,15 @@ def test_cache_view():
     with pytest.raises(KeyError):
         sub_cache[ethyl_acetate['inchi']]
 
+    sub_cache['InChI=' + ethyl_acetate['inchi']] = 8857
+    sub_cache[hexenal['inchi']] = hexenal['cid']
+    assert sorted(sub_cache.items()) == sorted([(ethyl_acetate['inchi'], 8857),
+        (hexenal['inchi'], hexenal['cid'])
+    ])
+    sub_cache.clear()
+    assert len(sub_cache) == 0
+    assert ethyl_acetate['inchi'] not in sub_cache
+
 
 def test_cache_values_roundtrip():
     values = [
@@ -482,11 +503,8 @@ def test_cache_values_roundtrip():
 
 
 def test_cache_persists_across_processes(pubchem, chemutils_test_cache):
-    import subprocess
-    import sys
-
     cu.convert('E2-hexenal', from_type='name', to_type='inchi')
-    cu._reset_cache_state()
+    new_process()
 
     code = ('import socket\n'
         'def blocked(*args, **kwargs): raise RuntimeError("network")\n'
@@ -496,31 +514,57 @@ def test_cache_persists_across_processes(pubchem, chemutils_test_cache):
     )
     out = subprocess.run([sys.executable, '-c', code], check=True,
         capture_output=True, text=True,
-        env={**__import__('os').environ, 'CHEMUTILS_CACHE': str(chemutils_test_cache)}
+        env={**os.environ, 'CHEMUTILS_CACHE': str(chemutils_test_cache)}
     ).stdout.strip()
     assert out == hexenal['inchi']
+
+
+def _convert_in_child(queue):
+    queue.put(cu.convert('(e)-2-hexenal', from_type='name', to_type='inchi'))
+
+
+def test_cache_after_fork(pubchem):
+    import multiprocessing
+
+    cu.convert('E2-hexenal', from_type='name', to_type='inchi')
+    # So child has to read from (its own connection to) the database.
+    cu._memo.clear()
+    pubchem.fail = True
+
+    ctx = multiprocessing.get_context('fork')
+    queue = ctx.Queue()
+    child = ctx.Process(target=_convert_in_child, args=(queue,))
+    child.start()
+    assert queue.get(timeout=30) == hexenal['inchi']
+    child.join(timeout=30)
+    assert child.exitcode == 0
+
+    # Parent's connection should still work.
+    cu._memo.clear()
+    assert cu.convert('E2-hexenal', from_type='name', to_type='inchi') == \
+        hexenal['inchi']
 
 
 # Using a fn defined in here (rather than one of the real lookup fns), to test cached
 # behavior without needing to fake any websites.
 fake_prop_calls = []
 
+def fake_prop_value(inchi):
+    return pd.Series({'fake_prop': float(len(inchi)), 'fake_prop_units': 'kPa'})
+
+
 @cu.cached
 def inchi2fake_prop(inchi, verbose=False):
     fake_prop_calls.append(inchi)
     if cu.isnull(inchi) or inchi == 'null':
         return pd.Series({'fake_prop': None, 'fake_prop_units': None})
-    return pd.Series({'fake_prop': float(len(inchi)), 'fake_prop_units': 'kPa'})
+    return fake_prop_value(inchi)
 
 
 @pytest.fixture
 def fake_prop():
     fake_prop_calls.clear()
     return fake_prop_calls
-
-
-def fake_prop_value(inchi):
-    return pd.Series({'fake_prop': float(len(inchi)), 'fake_prop_units': 'kPa'})
 
 
 @pytest.mark.parametrize('seed', [None, 'raw', 'normed'])
@@ -687,11 +731,8 @@ def test_add_properties_to_cache():
     })
     cu.add_properties_to_cache(df)
 
-    conn = sqlite3.connect(cu.cache_path())
-    rows = conn.execute("SELECT key, manual FROM entries WHERE to_type = 'density'"
-        ).fetchall()
-    conn.close()
-    assert rows == [(inchi, 1)]
+    assert [(k, m) for (_, _, k), (_, m) in db_entries(to_type='density').items()
+        ] == [(inchi, 1)]
 
     new_process()
     value = cu.inchi2density(inchi)

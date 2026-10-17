@@ -515,23 +515,19 @@ def _values_equal(a, b) -> bool:
     return bool(a == b)
 
 
-_hardcoded_normalized = None
+@functools.lru_cache(maxsize=None)
 def _get_hardcoded():
     """Returns `hardcoded` and `hardcoded_type2null_keys` values, with normalized keys.
 
-    Returned dict is of the form {from_type: {to_type: {normalized_key: value}}}.
+    Returned dict is of the form {(from_type, to_type): {normalized_key: value}}.
 
     Built on first use, since the normalization fns are defined below. These values
     take precedence over (and are never written to) the persistent cache.
     """
-    global _hardcoded_normalized
-    if _hardcoded_normalized is not None:
-        return _hardcoded_normalized
-
     normed = dict()
     for ft, tts in hardcoded.items():
         for tt, f2t_dict in tts.items():
-            normed_f2t = normed.setdefault(ft, dict()).setdefault(tt, dict())
+            normed_f2t = normed.setdefault((ft, tt), dict())
             for k, v in f2t_dict.items():
                 nk = normalize_id(ft, k)
                 if nk in normed_f2t and not _values_equal(normed_f2t[nk], v):
@@ -544,9 +540,8 @@ def _get_hardcoded():
         for nk in null_keys:
             nk = normalize_id(ft, nk)
             for tt in chem_id_types:
-                normed.setdefault(ft, dict()).setdefault(tt, dict()).setdefault(nk, None)
+                normed.setdefault((ft, tt), dict()).setdefault(nk, None)
 
-    _hardcoded_normalized = normed
     return normed
 
 
@@ -609,6 +604,9 @@ def _decode_value(text: str):
 
 def cache_path() -> Path:
     """Returns path to the persistent cache (CHEMUTILS_CACHE env var, if set).
+
+    Only read when the cache is first used in a process (or after
+    `_reset_cache_state()`).
     """
     return Path(os.environ.get('CHEMUTILS_CACHE', default_cache_file)).expanduser()
 
@@ -645,54 +643,85 @@ def _connect(path) -> sqlite3.Connection:
         'PRIMARY KEY (from_type, to_type, key)'
         ') WITHOUT ROWID'
     )
-    conn.execute(f'PRAGMA user_version = {_cache_schema_version}')
+    # Only setting if needed, as it requires a write lock (which would make opening
+    # wait for any other process writing).
+    if version == 0:
+        conn.execute(f'PRAGMA user_version = {_cache_schema_version}')
+
     return conn
+
+
+_insert_entry_sql = 'INSERT OR REPLACE INTO entries VALUES (?, ?, ?, ?, ?, ?)'
+
+def _entry_row(from_type: str, to_type: str, key, value, *, manual: bool = False,
+    updated: Optional[float] = None) -> tuple:
+    """Returns row of `entries` table (see `_connect`), for `_insert_entry_sql`.
+    """
+    if updated is None:
+        updated = time.time()
+    return (from_type, to_type, key, _encode_value(value), int(manual), updated)
+
+
+def _iter_entries(conn: sqlite3.Connection, from_type: Optional[str] = None,
+    to_type: Optional[str] = None):
+    """Yields (from_type, to_type, key, value, manual) for saved entries.
+
+    Optionally only for entries with the specified `from_type` and/or `to_type`.
+    """
+    conditions = {'from_type': from_type, 'to_type': to_type}
+    conditions = {k: v for k, v in conditions.items() if v is not None}
+    where = ''
+    if len(conditions) > 0:
+        where = ' WHERE ' + ' AND '.join(f'{k} = ?' for k in conditions)
+
+    for ft, tt, key, value, manual in conn.execute('SELECT from_type, to_type, key, '
+        f'value, manual FROM entries{where}', list(conditions.values())):
+
+        yield ft, tt, key, _decode_value(value), manual
 
 
 # Sentinel returned by _cache_get when there is no entry.
 _missing = object()
 
 _conn = None
-# (CHEMUTILS_CACHE value, pid) _conn was opened with
-_conn_state = None
 
-# (from_type, to_type, key) -> value (or _missing), for entries read from the database
-# in this process.
-_memo_read = dict()
-# (from_type, to_type, key) -> value, for entries written in this process.
-_memo_written = dict()
+# (from_type, to_type, key) -> (value [or _missing], whether value was written in this
+# process)
+_memo = dict()
 # Set by clear_cache(). If True, only values written in this process are used.
 _session_only = False
 
 def _reset_cache_state():
     """Closes cache database and clears in-memory state (e.g. to change cache path).
     """
-    global _conn, _conn_state, _session_only
+    global _conn, _session_only
 
-    # Not closing connections inherited from a parent process, as that can break the
-    # parent's locks.
-    if _conn is not None and _conn_state[1] == os.getpid():
+    if _conn is not None:
         _conn.close()
 
     _conn = None
-    _conn_state = None
-    _memo_read.clear()
-    _memo_written.clear()
+    _memo.clear()
     _session_only = False
 
 
+def _forget_parent_conn():
+    global _conn
+    # Not closing connection inherited from parent process, as that can break the
+    # parent's locks.
+    _conn = None
+
+# (not available on Windows, which also can't fork)
+if hasattr(os, 'register_at_fork'):
+    os.register_at_fork(after_in_child=_forget_parent_conn)
+
+
 def _get_conn() -> sqlite3.Connection:
-    global _conn, _conn_state
-
-    state = (os.environ.get('CHEMUTILS_CACHE'), os.getpid())
-    if _conn is not None and state == _conn_state:
+    global _conn
+    if _conn is not None:
         return _conn
-
-    _reset_cache_state()
 
     path = cache_path()
     _conn = _connect(path)
-    _conn_state = state
 
     if (path == Path(default_cache_file) and exists(old_pickle_cache_file) and
         _conn.execute('SELECT 1 FROM entries LIMIT 1').fetchone() is None):
@@ -707,7 +736,7 @@ def _get_conn() -> sqlite3.Connection:
 
 def _cache_get(from_type: str, to_type: str, key, *, session_only: bool = False,
     use_hardcoded: bool = True):
-    """Returns cached value for (already normalized) `key`, or `_missing`.
+    """Returns cached value for `key` (normalized here), or `_missing`.
 
     Hardcoded values take precedence over everything else.
 
@@ -715,65 +744,61 @@ def _cache_get(from_type: str, to_type: str, key, *, session_only: bool = False,
         session_only: if True, only values written during this process are used
             (to implement `ignore_cache=True`).
     """
-    conn = _get_conn()
+    key = normalize_id(from_type, key)
 
     if use_hardcoded:
-        hardcoded_f2t = _get_hardcoded().get(from_type, dict()).get(to_type)
+        hardcoded_f2t = _get_hardcoded().get((from_type, to_type))
         if hardcoded_f2t is not None and key in hardcoded_f2t:
             return hardcoded_f2t[key]
 
     memo_key = (from_type, to_type, key)
-    if memo_key in _memo_written:
-        return _memo_written[memo_key]
+    session_only = session_only or _session_only
+    memoized = _memo.get(memo_key)
+    if memoized is not None and (memoized[1] or not session_only):
+        return memoized[0]
 
-    if session_only or _session_only:
+    if session_only:
         return _missing
 
-    if memo_key in _memo_read:
-        return _memo_read[memo_key]
-
-    row = conn.execute('SELECT value FROM entries WHERE from_type = ? AND to_type = ? '
-        'AND key = ?', memo_key
+    row = _get_conn().execute('SELECT value FROM entries WHERE from_type = ? AND '
+        'to_type = ? AND key = ?', memo_key
     ).fetchone()
     value = _missing if row is None else _decode_value(row[0])
-    _memo_read[memo_key] = value
+    _memo[memo_key] = (value, False)
     return value
 
 
 def _cache_set(from_type: str, to_type: str, key, value, *, manual: bool = False
     ) -> None:
-    """Saves `value` for (already normalized) `key` to the cache.
+    """Saves `value` for `key` (normalized here) to the cache.
+
+    Raises ValueError (without saving) if `value` is a property with unexpected units.
     """
-    conn = _get_conn()
-    conn.execute('INSERT OR REPLACE INTO entries VALUES (?, ?, ?, ?, ?, ?)',
-        (from_type, to_type, key, _encode_value(value), int(manual), time.time())
+    key = normalize_id(from_type, key)
+    _check_property_value(to_type, value)
+    _get_conn().execute(_insert_entry_sql,
+        _entry_row(from_type, to_type, key, value, manual=manual)
     )
-    memo_key = (from_type, to_type, key)
-    _memo_read.pop(memo_key, None)
-    _memo_written[memo_key] = value
+    _memo[(from_type, to_type, key)] = (value, True)
 
 
 def _cache_delete(from_type: str, to_type: str, keys=None) -> None:
-    """Deletes (already normalized) `keys` (all, if None) from cache.
+    """Deletes `keys` (normalized here) from cache. Deletes all keys if None.
     """
     conn = _get_conn()
     if keys is None:
         conn.execute('DELETE FROM entries WHERE from_type = ? AND to_type = ?',
             (from_type, to_type)
         )
-        def matches(memo_key):
-            return memo_key[:2] == (from_type, to_type)
+        memo_keys = [k for k in _memo if k[:2] == (from_type, to_type)]
     else:
-        keys = set(keys)
+        memo_keys = [(from_type, to_type, normalize_id(from_type, k)) for k in keys]
         conn.executemany('DELETE FROM entries WHERE from_type = ? AND to_type = ? '
-            'AND key = ?', [(from_type, to_type, k) for k in keys]
+            'AND key = ?', memo_keys
         )
-        def matches(memo_key):
-            return memo_key[:2] == (from_type, to_type) and memo_key[2] in keys
 
-    for memo in (_memo_read, _memo_written):
-        for memo_key in [k for k in memo if matches(k)]:
-            del memo[memo_key]
+    for memo_key in memo_keys:
+        _memo.pop(memo_key, None)
 
 
 class _SubCache(MutableMapping):
@@ -786,23 +811,18 @@ class _SubCache(MutableMapping):
         self.from_type = from_type
         self.to_type = to_type
 
-    def _key(self, key):
-        return normalize_id(self.from_type, key)
-
     def __getitem__(self, key):
-        value = _cache_get(self.from_type, self.to_type, self._key(key),
-            use_hardcoded=False
-        )
+        value = _cache_get(self.from_type, self.to_type, key, use_hardcoded=False)
         if value is _missing:
             raise KeyError(key)
         return value
 
     def __setitem__(self, key, value):
-        _cache_set(self.from_type, self.to_type, self._key(key), value)
+        _cache_set(self.from_type, self.to_type, key, value)
 
     def __delitem__(self, key):
         self[key]
-        _cache_delete(self.from_type, self.to_type, [self._key(key)])
+        _cache_delete(self.from_type, self.to_type, [key])
 
     def __iter__(self):
         rows = _get_conn().execute('SELECT key FROM entries WHERE from_type = ? AND '
@@ -814,6 +834,15 @@ class _SubCache(MutableMapping):
         return _get_conn().execute('SELECT COUNT(*) FROM entries WHERE from_type = ? '
             'AND to_type = ?', (self.from_type, self.to_type)
         ).fetchone()[0]
+
+    # (overriding these MutableMapping defaults, which query each key separately)
+    def clear(self):
+        _cache_delete(self.from_type, self.to_type)
+
+    def items(self):
+        return [(k, v) for _, _, k, v, _ in
+            _iter_entries(_get_conn(), self.from_type, self.to_type)
+        ]
 
 
 class _Cache:
@@ -832,17 +861,6 @@ class _FromTypeCache:
 cache = _Cache()
 
 
-def _clear_one_cache(ft, tt):
-    _cache_delete(ft, tt)
-
-
-def _clear_vals_in_cache(ft, tt, vals):
-    if type(vals) is str or not hasattr(vals, '__iter__'):
-        vals = [vals]
-
-    _cache_delete(ft, tt, [normalize_id(ft, v) for v in vals])
-
-
 def clear_cache(*args):
     """
     clear_cache(): ignores all previously saved values for the rest of this process,
@@ -856,9 +874,7 @@ def clear_cache(*args):
     global _session_only
 
     if len(args) == 0:
-        _get_conn()
-        _memo_read.clear()
-        _memo_written.clear()
+        _memo.clear()
         _session_only = True
         return
 
@@ -866,10 +882,13 @@ def clear_cache(*args):
         raise ValueError(f'from_type must be one of {chem_id_types}')
 
     if len(args) == 2:
-        _clear_one_cache(*args)
+        _cache_delete(*args)
 
     elif len(args) == 3:
-        _clear_vals_in_cache(*args)
+        ft, tt, vals = args
+        if not pd.api.types.is_list_like(vals):
+            vals = [vals]
+        _cache_delete(ft, tt, vals)
 
     else:
         raise ValueError('can only call with 0, 2, or 3 arguments')
@@ -878,12 +897,9 @@ def clear_cache(*args):
 def _clear_null_cache_vals():
     """Deletes all null values (including all-null Series) from cache.
     """
-    rows = _get_conn().execute('SELECT from_type, to_type, key, value FROM entries'
-        ).fetchall()
-
     to_delete = dict()
-    for from_type, to_type, key, value in rows:
-        if isnull(_decode_value(value)):
+    for from_type, to_type, key, value, _ in _iter_entries(_get_conn()):
+        if isnull(value):
             to_delete.setdefault((from_type, to_type), []).append(key)
 
     for (from_type, to_type), keys in to_delete.items():
@@ -896,18 +912,25 @@ def delete_cache():
     path = cache_path()
     _reset_cache_state()
     for p in (path, Path(f'{path}-wal'), Path(f'{path}-shm')):
-        if p.exists():
-            p.unlink()
+        p.unlink(missing_ok=True)
+
+
+@functools.lru_cache(maxsize=None)
+def _preferred_units(prop: str):
+    return ureg(property2preferred_units[prop])
 
 
 def _check_property_value(prop: str, value) -> None:
     """Raises ValueError if `value` (a lookup output for `prop`) has unexpected units.
     """
-    if prop not in property2preferred_units or isnull(value):
+    if prop not in property2preferred_units:
         return
 
     unit_key = f'{prop}_units'
     if not is_series(value) or prop not in value or unit_key not in value:
+        if isnull(value):
+            return
+
         raise ValueError(f'{prop} value should be a Series with {prop} and {unit_key}:'
             f'\n{value}'
         )
@@ -915,7 +938,7 @@ def _check_property_value(prop: str, value) -> None:
     if pd.isnull(value[prop]):
         return
 
-    preferred_units = ureg(property2preferred_units[prop])
+    preferred_units = _preferred_units(prop)
     units = value[unit_key]
     if pd.isnull(units) or not preferred_units.check(units):
         raise ValueError(f'{prop} units {units} inconsistent with {preferred_units}')
@@ -1002,9 +1025,6 @@ def cached(fn):
                 #
                 kwargs.pop('verbose')
 
-        if isnull(key):
-            return fn(key, **kwargs)
-
         key = normalize_id(f, key)
         if isnull(key):
             return fn(key, **kwargs)
@@ -1022,7 +1042,6 @@ def cached(fn):
             if cached_value is not _missing and not isnull(cached_value):
                 return value
 
-        _check_property_value(t, value)
         _cache_set(f, t, key, value)
         return value
 
@@ -1198,6 +1217,15 @@ def convertable(chem_id_type: str) -> bool:
     if chem_id_type in chem_id_types or chem_id_type in equivalent_col_names:
         return True
     return False
+
+
+def _cache_failed_lookup(from_type: str, chem_id, skip=tuple()) -> None:
+    """Caches null values for `chem_id`, for each of `chem_id_types` not in `skip`.
+    """
+    for tt in chem_id_types:
+        # To not overwrite existing (e.g. hardcoded) values for other types.
+        if tt not in skip and _cache_get(from_type, tt, chem_id) is _missing:
+            _cache_set(from_type, tt, chem_id, None)
 
 
 # TODO TODO tqdm in all but single element case (way to make it work in case
@@ -1434,15 +1462,12 @@ def convert(chem_id, from_type=None, to_type='inchi', *, verbose: bool = False,
                         # TODO TODO test other normalize case + other fn name
                         # lookup cases in c in equivalent_col_names case, since
                         # that caused the failure here
-                        norm_fn_name = 'normalize_' + ft
-                        if norm_fn_name in globals():
-                            if verbose:
-                                print(f'applying {norm_fn_name} to input column')
+                        if verbose:
+                            print(f'applying normalize_{ft} to input column')
 
-                            # TODO still print same kind of verbose stuff as
-                            # other normalization section does (refactor?)
-                            norm_fn = globals()[norm_fn_name]
-                            df[c] = df[c].apply(norm_fn)
+                        # TODO still print same kind of verbose stuff as
+                        # other normalization section does (refactor?)
+                        df[c] = df[c].map(functools.partial(normalize_id, ft))
                         #
                         attempts[c] = convert(df[c], **kwargs)
 
@@ -1617,11 +1642,7 @@ def convert(chem_id, from_type=None, to_type='inchi', *, verbose: bool = False,
                     )
 
         if cid is None:
-            for tt in chem_id_types:
-                # To not overwrite existing (e.g. hardcoded) values for other types.
-                if _cache_get(from_type, tt, chem_id) is _missing:
-                    _cache_set(from_type, tt, chem_id, None)
-
+            _cache_failed_lookup(from_type, chem_id)
             conversion_fail_err()
             return None
 
@@ -1663,14 +1684,8 @@ def convert(chem_id, from_type=None, to_type='inchi', *, verbose: bool = False,
         if verbose:
             print(f'creating Compound from CID {cid} failed!')
 
-        for tt in chem_id_types:
-            # Just because we technically did get a non-null cid before.
-            if tt == 'cid':
-                continue
-            # To not overwrite existing (e.g. hardcoded) values for other types.
-            if _cache_get(from_type, tt, chem_id) is _missing:
-                _cache_set(from_type, tt, chem_id, None)
-
+        # Skipping 'cid' just because we technically did get a non-null cid before.
+        _cache_failed_lookup(from_type, chem_id, skip=('cid',))
         conversion_fail_err()
         return None
 
@@ -1690,9 +1705,7 @@ def convert(chem_id, from_type=None, to_type='inchi', *, verbose: bool = False,
     else:
         to_type_val = compound2t_fn(compound)
 
-    if to_type == 'cid':
-        to_type_val = normalize_cid(to_type_val)
-
+    to_type_val = _normalize_value(to_type, to_type_val)
     _cache_set(from_type, to_type, chem_id, to_type_val)
 
     if verbose and to_type_val is None:
@@ -1707,14 +1720,30 @@ def normalize_id(chem_id_type: str, chem_id):
 
     All normalization fns are idempotent and return null for null input.
     """
-    if chem_id_type in equivalent_col_names:
-        chem_id_type = equivalent_col_names[chem_id_type]
-
-    norm_fn = globals().get(f'normalize_{chem_id_type}')
+    norm_fn = _normalize_fn(chem_id_type)
     if norm_fn is None:
         return chem_id
 
     return norm_fn(chem_id)
+
+
+@functools.lru_cache(maxsize=None)
+def _normalize_fn(chem_id_type: str) -> Optional[Callable]:
+    chem_id_type = equivalent_col_names.get(chem_id_type, chem_id_type)
+    return globals().get(f'normalize_{chem_id_type}')
+
+
+# Types whose values (not just keys) are normalized before caching.
+_value_normalized_types = ('cid', 'inchi', 'inchikey', 'cas')
+
+def _normalize_value(chem_id_type: str, value):
+    """Returns lookup output `value`, normalized if its type is in
+    `_value_normalized_types`.
+    """
+    if chem_id_type not in _value_normalized_types:
+        return value
+
+    return normalize_id(chem_id_type, value)
 
 
 # E/Z stereo descriptors (e.g. '(e)-', '(e,z)-'), which normalize_name keeps uppercase,
@@ -1732,18 +1761,6 @@ def normalize_name(name):
 
 @functools.lru_cache(maxsize=2**16)
 def _normalize_name(name: str) -> Optional[str]:
-    # Repeating until output stops changing, so that normalize_name is idempotent.
-    for _ in range(10):
-        normed_name = _normalize_name_once(name)
-        if normed_name is None or normed_name == name:
-            return normed_name
-        name = normed_name
-
-    warn(f'normalize_name did not converge for {name!r}')
-    return name
-
-
-def _normalize_name_once(name: str) -> Optional[str]:
     # TODO don't lowercase letters appearing by themselves?
     name = name.replace('(CAS)', '').strip().lower()
 
@@ -1757,7 +1774,9 @@ def _normalize_name_once(name: str) -> Optional[str]:
     # TODO TODO TODO was this causing the parts[0] IndexError on Virginie's
     # compiled data?
     # Added $ (end of string) 2020-06-17
-    name = re.sub(r'\([^\(\)]{4,}\)$', '', name)
+    # Removing all such trailing parentheticals (not just the last), so this is
+    # idempotent.
+    name = re.sub(r'(\s*\([^\(\)]{4,}\))+$', '', name)
 
     parts = name.split()
 
@@ -1816,9 +1835,13 @@ def _normalize_name_once(name: str) -> Optional[str]:
         'z2-': '(Z)-2-',
         'z3-': '(Z)-3-',
     }
-    for p, c in prefix_corrections.items():
-        if normed_name.startswith(p):
-            normed_name = c + normed_name[len(p):]
+    def correct_prefix(n):
+        for p, c in prefix_corrections.items():
+            if n.startswith(p):
+                n = c + n[len(p):]
+        return n
+
+    normed_name = correct_prefix(normed_name)
 
     def ester_acid(n):
         if ' ester ' in n and ' acid' in n:
@@ -1837,6 +1860,8 @@ def _normalize_name_once(name: str) -> Optional[str]:
             print(f'indicator {i.__name__} was True for {normed_name}')
             normed_name = c(normed_name)
             print(f'applying correction {c.__name__} to get {normed_name}.')
+            # Since correction can move a part needing prefix correction to the start.
+            normed_name = correct_prefix(normed_name)
 
     # So '(E)-'/'(Z)-' (from corrections above, or in input) are not lowercased.
     normed_name = _ez_descriptor_re.sub(lambda m: m.group(0).upper(), normed_name)
@@ -1864,13 +1889,19 @@ def normalize_cas(cas):
     return normed_cas
 
 
-def _strip_prefix(chem_id: str, prefix: str) -> str:
-    """Strips whitespace and (any number of repeats of) case-insensitive `prefix`.
+def _normalize_str(chem_id, prefix: str = ''):
+    """Strips whitespace and (any repeats of) case-insensitive `prefix`.
+
+    Returns null input as-is, and None for empty strings.
     """
+    if pd.isnull(chem_id):
+        return chem_id
+
     chem_id = chem_id.strip()
-    while chem_id.lower().startswith(prefix.lower()):
+    while prefix and chem_id.lower().startswith(prefix.lower()):
         chem_id = chem_id[len(prefix):].strip()
-    return chem_id
+
+    return chem_id if len(chem_id) > 0 else None
 
 
 def normalize_inchi(inchi):
@@ -1879,27 +1910,20 @@ def normalize_inchi(inchi):
     >>> normalize_inchi('InChI=1S/CH4/h1H4')
     '1S/CH4/h1H4'
     """
-    if pd.isnull(inchi):
-        return inchi
+    return _normalize_str(inchi, 'InChI=')
 
-    inchi = _strip_prefix(inchi, 'InChI=')
-    if len(inchi) == 0:
-        return None
 
-    return inchi
+def _inchi_with_prefix(inchi: str) -> str:
+    """Returns InChI with exactly one 'InChI=' prefix (as websites expect).
+    """
+    return 'InChI=' + normalize_inchi(inchi)
 
 
 def normalize_inchikey(inchikey):
     """Returns uppercase InChIKey without whitespace or 'InChIKey=' prefix.
     """
-    if pd.isnull(inchikey):
-        return inchikey
-
-    inchikey = _strip_prefix(inchikey, 'InChIKey=').upper()
-    if len(inchikey) == 0:
-        return None
-
-    return inchikey
+    inchikey = _normalize_str(inchikey, 'InChIKey=')
+    return inchikey.upper() if isinstance(inchikey, str) else inchikey
 
 
 def normalize_cid(cid) -> Optional[int]:
@@ -1923,14 +1947,7 @@ def normalize_cid(cid) -> Optional[int]:
 
 def normalize_smiles(smiles):
     """Returns SMILES without surrounding whitespace."""
-    if pd.isnull(smiles):
-        return smiles
-
-    smiles = smiles.strip()
-    if len(smiles) == 0:
-        return None
-
-    return smiles
+    return _normalize_str(smiles)
 
 
 pubchem_root_url = 'https://pubchem.ncbi.nlm.nih.gov'
@@ -2079,7 +2096,7 @@ def inchikey2cid(inchikey, verbose=False):
 
 
 def inchi2cid(inchi, verbose=False):
-    inchi = 'InChI=' + normalize_inchi(inchi)
+    inchi = _inchi_with_prefix(inchi)
     try:
         results = pcp.get_compounds(inchi, 'inchi')
     except urllib.error.URLError as e:
@@ -2335,9 +2352,8 @@ def chemspider_experimental_density(csid, verbose=False):
 
 nist_url_prefix = 'http://webbook.nist.gov'
 def inchi2nist_webbook_url(inchi):
-    inchi = normalize_inchi(inchi)
     # TODO replace w/ general url escaping library call? stdlib?
-    inchi_str = 'InChI=' + inchi.replace('/','%2F').replace(',','%2C').replace(
+    inchi_str = _inchi_with_prefix(inchi).replace('/','%2F').replace(',','%2C').replace(
         '+', '%2B'
     )
     # TODO need to explicitly ask for the data we want though? links should show up in
@@ -3235,13 +3251,9 @@ def inchi2chemspider_id(inchi):
 
     cs = _chemspider_session
 
-    # TODO factor assertion that it doesn't already start w/ inchi into @cached(/wrapper
-    # that expands on what @cached does)
-    assert not inchi.startswith('InChI=')
-
     # Docs seem to claim inchi could be passed just as if it were name,
     # but my testing did not seem to bear that out.
-    inchi_with_prefix = 'InChI=' + inchi
+    inchi_with_prefix = _inchi_with_prefix(inchi)
 
     # (sleeping doesn't seem to really have an effect on how many calls we can get)
     # 1st key: (sleep=0.2) -319
@@ -3635,9 +3647,8 @@ def inchi2maxplanck_k_henry(inchi, verbose=False):
     if inchi is None:
         return null_dict
 
-    assert not inchi.startswith('InChI=')
     # Returns None on error
-    inchikey = InchiToInchiKey(f'InChI={inchi}')
+    inchikey = InchiToInchiKey(_inchi_with_prefix(inchi))
     assert inchikey is not None
 
     # TODO cf

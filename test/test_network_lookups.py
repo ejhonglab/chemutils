@@ -10,21 +10,22 @@ from chemspipy.errors import ChemSpiPyHTTPError
 import pytest
 
 import chemutils as cu
+from test_cache import ethyl_acetate, new_process
 
 
 pytestmark = pytest.mark.network
 
-# Ethyl acetate: https://pubchem.ncbi.nlm.nih.gov/compound/8857
-cid = 8857
-inchi = '1S/C4H8O2/c1-3-6-4(2)5/h3H2,1-2H3'
-inchikey = 'XEKOWRVHYACXOJ-UHFFFAOYSA-N'
-cas = '141-78-6'
+# https://pubchem.ncbi.nlm.nih.gov/compound/8857
+cid = ethyl_acetate['cid']
+inchi = ethyl_acetate['inchi']
+inchikey = ethyl_acetate['inchikey']
+cas = ethyl_acetate['cas']
 
 
 def check_second_call_cached(network_guard, fn, *args, **kwargs):
     """Returns `fn(*args, **kwargs)` after resetting cache state and blocking network.
     """
-    cu._reset_cache_state()
+    new_process()
     network_guard.blocking = True
     value = fn(*args, **kwargs)
     assert network_guard.attempts == []
