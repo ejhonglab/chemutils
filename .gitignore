@@ -1,3 +1,4 @@
 *.egg-info/
 *_sheet_link.txt
 venv
+venv_backups/
