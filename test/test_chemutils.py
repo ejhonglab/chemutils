@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import numpy as np
 import pandas as pd
 import pubchempy as pcp
 import pytest
@@ -84,3 +85,71 @@ def test_allowed_kwarg():
     assert allowed_kwarg(f3, 'verbose')
     assert not allowed_kwarg(f4, 'verbose')
 
+
+
+@pytest.mark.parametrize('value,expected', [
+    (60000.0, 60000.0),
+    ('60000.', 60000.0),
+    ('6.0×10+8', 6.0e8),
+    ('1.2×10−3', 1.2e-3),
+    ('>6.0×10+8', np.nan),
+    ('<4.0×10+11', np.nan),
+])
+def test_parse_nist_number(value, expected):
+    assert cu._parse_nist_number(value) == pytest.approx(expected, nan_ok=True)
+
+
+@pytest.mark.parametrize('value,expected', [
+    ('1.9', 1.9),
+    (0.2, 0.2),
+    ('1.2×10−3', 1.2e-3),
+    ('9.9×1023', 9.9e23),
+])
+def test_parse_henrys_law_org_number(value, expected):
+    assert cu._parse_henrys_law_org_number(value) == pytest.approx(expected)
+
+
+def test_inchi2est_k_henry(monkeypatch):
+    monkeypatch.setattr(cu, 'inchi2water_solubility', lambda inchi, **kwargs:
+        cu._property_series('water_solubility', 0.5, 'x', 'g / L')
+    )
+    monkeypatch.setattr(cu, 'inchi2vapor_pressure', lambda inchi, **kwargs:
+        cu._property_series('vapor_pressure', 2.0, 'y', 'kPa', measured=True)
+    )
+    monkeypatch.setattr(cu, 'inchi2molar_mass', lambda inchi, **kwargs:
+        cu._property_series('molar_mass', 100.0, 'z', 'g/mol')
+    )
+    ret = cu.inchi2est_k_henry('1S/CH4/h1H4')
+    # 0.5 g/L / (100 g/mol) = 5 mol/m^3, / 2000 Pa
+    assert ret['k_henry'] == pytest.approx(5 / 2000)
+    assert ret['k_henry_units'] == 'mol / m^3 / Pa'
+    assert 'VP/AS' in ret['k_henry_sources']
+
+    monkeypatch.setattr(cu, 'inchi2vapor_pressure', lambda inchi, **kwargs:
+        cu._property_series('vapor_pressure', measured=None)
+    )
+    assert cu.inchi2est_k_henry('1S/CH4/h1H4').isnull().all()
+
+
+@pytest.mark.parametrize('measured', [True, False, None])
+def test_pfo_vapor_pressure_measured(monkeypatch, measured):
+    # (PubChem value, as there is no thermo Chemical)
+    values = {'vapor_pressure_measured': measured}
+    if measured is None:
+        # (cached before this key was added)
+        values = {}
+    monkeypatch.setattr(cu, 'inchi2vapor_pressure', lambda inchi, **kwargs:
+        cu._property_series('vapor_pressure', 2.0, 'url', 'kPa', **{
+            k.replace('vapor_pressure_', ''): v for k, v in values.items()
+        })
+    )
+    psat, source, ret_measured = cu._pfo_vapor_pressure('1S/CH4/h1H4', None, 298.15, None)
+    assert psat == pytest.approx(2000)
+    assert source.startswith('PubChem')
+    assert ret_measured == measured
+
+
+@pytest.mark.network
+def test_compound2title():
+    compound = pcp.Compound.from_cid(6549)
+    assert cu.compound2title(compound) == 'Linalool'

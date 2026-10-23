@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 
-import pubchemprops.pubchemprops as pp
 import pytest
 
 import chemutils as cu
@@ -59,15 +58,42 @@ def _mmhg2kpa(mmhg):
     (['0.0012 torr (2% aqueous solution)'], None),
 ])
 def test_inchi2vapor_pressure_temps(monkeypatch, strings, expected_kpa):
-    results = [{'Value': {'StringWithMarkup': [{'String': s}]}} for s in strings]
-    monkeypatch.setattr(pp, 'get_second_layer_props',
-        lambda name, props, cid=False: {'Vapor Pressure': results}
-    )
-    monkeypatch.setattr(cu, 'convert', lambda *args, **kwargs: 1)
-
-    ret = cu.inchi2vapor_pressure('1S/CH4/h1H4')
+    ret = _vapor_pressure(monkeypatch, strings)
     if expected_kpa is None:
         assert ret.isnull().all()
     else:
         assert ret['vapor_pressure'] == pytest.approx(expected_kpa)
         assert ret['vapor_pressure_units'] == 'kPa'
+        assert ret['vapor_pressure_measured'] == True
+
+
+def _vapor_pressure(monkeypatch, strings):
+    results = [{'Value': {'StringWithMarkup': [{'String': s}]}} for s in strings]
+    monkeypatch.setattr(cu, 'pubchem_heading_information', lambda cid, heading: results)
+    monkeypatch.setattr(cu, 'convert', lambda *args, **kwargs: 1)
+    return cu.inchi2vapor_pressure('1S/CH4/h1H4')
+
+
+@pytest.mark.parametrize('strings,expected_kpa,measured', [
+    # Estimates only used if there are no measured values
+    (['0.39 mm Hg at 25 °C /est/', '0.5 mm Hg at 20 °C'], _mmhg2kpa(0.5), True),
+    (['0.39 mm Hg at 25 °C /est/', '0.45 [mmHg]'], _mmhg2kpa(0.45), True),
+    (['0.39 mm Hg at 25 °C /est/', '0.4 mm Hg at 25 °C (estimated)'], _mmhg2kpa(0.395),
+        False
+    ),
+    # (fits to measurements count as measured)
+    (['0.453 mm Hg @ 25 °C, calculated from experimentally derived coefficients',
+        '0.39 mm Hg at 25 °C /est/'], _mmhg2kpa(0.453), True
+    ),
+    # Extrapolated values are not used (whatever the case / spelling)
+    (['255 mm Hg at 25 °C /Extrapolated/', '6.56X10-6 mm Hg at 25 °C (exptrapolated)'],
+        None, None
+    ),
+])
+def test_inchi2vapor_pressure_estimates(monkeypatch, strings, expected_kpa, measured):
+    ret = _vapor_pressure(monkeypatch, strings)
+    assert ret['vapor_pressure_measured'] == measured
+    if expected_kpa is None:
+        assert ret.isnull().all()
+    else:
+        assert ret['vapor_pressure'] == pytest.approx(expected_kpa)

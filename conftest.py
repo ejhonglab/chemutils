@@ -1,7 +1,7 @@
 """
-Configures a temporary chemutils cache (via the CHEMUTILS_CACHE environment variable)
-for all tests, so they never read or modify the real cache, and blocks network access
-in tests not marked with `@pytest.mark.network`.
+Configures a temporary chemutils cache and log (via the CHEMUTILS_CACHE and
+CHEMUTILS_LOG environment variables) for all tests, so they never read or modify the
+real ones, and blocks network access in tests not marked with `@pytest.mark.network`.
 """
 
 import os
@@ -22,6 +22,7 @@ def pytest_configure(config):
     # outside of the fixture below can not use the real cache.
     _session_cache_dir = tempfile.mkdtemp(prefix='chemutils_test_cache_')
     os.environ['CHEMUTILS_CACHE'] = str(Path(_session_cache_dir) / 'cache.sqlite')
+    os.environ['CHEMUTILS_LOG'] = str(Path(_session_cache_dir) / 'chemutils.log')
 
 
 def pytest_unconfigure(config):

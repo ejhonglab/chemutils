@@ -1,0 +1,51 @@
+Feature ideas from TODO comments removed from chemutils.py (2026-10-23), not implemented.
+
+New data sources
+- NIST WebBook Antoine equation parameters, to compute vapor pressures at 25 C (checking
+  each fit's valid temperature range).
+- chemicalbook.com vapor pressures (check where their data comes from, and whether they
+  mark estimates).
+- ChemSpider (chemspipy) as a fallback for vapor pressure and water solubility (it also
+  has EPI Suite predictions), and NIST for water solubility.
+- PubChem's "Henry's Law Constant" section, as another source for inchi2k_henry.
+- henrys-law.org's data downloads (.sql / .f90), instead of scraping pages.
+
+Architecture
+- General handling of multiple sources per property: a cached lookup per source, and one
+  function that picks between (or averages) them, with an output saying which source was
+  used.
+- Cache raw downloaded pages / responses, so parsing can be changed and re-run without
+  new requests.
+- Fill in the reverse direction in the cache for 1:1 conversions (e.g. InChI <->
+  InChIKey).
+- Property lookup outputs without the property name repeated in every key (e.g. 'value',
+  'units', 'sources'). Would change the API.
+- Progress bars (tqdm) when converting many IDs, and an option for convert to also
+  return the conversion table.
+- Converting to names with a priority on sources (e.g. hardcoded, odor inventory names,
+  Hallem names, then PubChem).
+
+Data quality
+- NIST Henry's law constants: average only measured ('M') rows, prefer those with
+  temperature dependence, and drop values from 'missing citation' sources.
+- henrys-law.org: use its temperature dependence data, consider excluding VP/AS ('V')
+  estimates, and re-run cached lookups (the site has newer values, e.g. toluene now
+  0.0016 vs 0.0015 cached, and cached sources lack the notes now included).
+- inchi2k_henry: option to average across sources, and warn when they differ a lot.
+- Outlier detection (e.g. values orders of magnitude from the rest) before averaging
+  PubChem values.
+
+ChemSpider
+- Each InChI search seems to use ~3 API calls (hitting rate limits after ~320 searches).
+  Maybe modify ChemSpiPy to use fewer.
+
+Property spreadsheets (load_or_save_excel_properties)
+- Number formatting: limited significant figures, scientific notation only for very
+  small / large values, and none for integer columns.
+- Autofit column widths, and no default red formatting of URLs.
+- Check written values match those read back.
+
+Hardcoded / manually entered properties
+- Move to external, deployment-specific files (outside the package directory).
+- A 'weight' column for values with multiple sources.
+- Check InChIs against names, to catch data entry errors.

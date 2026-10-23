@@ -16,6 +16,15 @@ import chemutils as cu
 # TODO load chemspider api key from some default places / env var for lookups
 # that can use that (make fn in chemutils that can do this)
 
+def lookup_quantity(series, prop):
+    """Returns `prop` in chemutils lookup output `series` as a pint Quantity (None if
+    null).
+    """
+    if cu.isnull(series[prop]):
+        return None
+    return cu.ureg.Quantity(series[prop], series[f'{prop}_units'])
+
+
 def ul_soluble_in_ml_water(ml_water, water_solubility, density=None,
     molar_mass=None):
     """
@@ -133,8 +142,8 @@ def print_vol_soluble_in_water_vols(name_or_names, water_vols_ml=(2.0, 20.0),
     if inchi or pubchem_url:
         lprint()
 
-    density = cu.inchi2density(_inchi, ignore_cache=ignore_cache,
-        verbose=verbose, pint=True
+    density = lookup_quantity(cu.inchi2density(_inchi, ignore_cache=ignore_cache,
+        verbose=verbose), 'density'
     )
     failed = False
     if density is None:
@@ -146,8 +155,8 @@ def print_vol_soluble_in_water_vols(name_or_names, water_vols_ml=(2.0, 20.0),
     # TODO TODO does function that looks this up also have temperature
     # information at some point? try to preserve that in the output, so it can
     # be printed here
-    water_solubility = cu.inchi2water_solubility(_inchi,
-        ignore_cache=ignore_cache, verbose=verbose, pint=True
+    water_solubility = lookup_quantity(cu.inchi2water_solubility(_inchi,
+        ignore_cache=ignore_cache, verbose=verbose), 'water_solubility'
     )
     if water_solubility is None:
         lprint('Water solubility lookup failed!')
@@ -161,8 +170,8 @@ def print_vol_soluble_in_water_vols(name_or_names, water_vols_ml=(2.0, 20.0),
 
     # would only be necessary if solubility was reported in molar units
     '''
-    molar_mass = cu.inchi2molar_mass(_inchi, ignore_cache=ignore_cache,
-        verbose=verbose, pint=True
+    molar_mass = lookup_quantity(cu.inchi2molar_mass(_inchi,
+        ignore_cache=ignore_cache, verbose=verbose), 'molar_mass'
     )
     print(f'Molar mass: {molar_mass:.1f}')
     '''

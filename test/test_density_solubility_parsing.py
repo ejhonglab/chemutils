@@ -4,7 +4,6 @@ Tests parsing of the strings in PubChem's 'Density' and 'Solubility' sections (a
 `inchi2density` and `inchi2water_solubility` use them), with examples from PubChem pages.
 """
 
-import pubchemprops.pubchemprops as pp
 import pytest
 
 import chemutils as cu
@@ -66,6 +65,13 @@ def test_parse_density(string, expected_g_ml):
     ('2.5 g in 100 mL water', 25),
     ('1.3 G SOL IN 100 ML WATER', 13),
     ('1 gram dissolves in 1000 mL water, 80 mL boiling water, 0.8 mL alcohol', 1),
+    ('Soluble in about 720 parts water, in many organic solvents', 1000 / 720),
+    ('Soluble in 120 parts water at 25 °C', 1000 / 120),
+    # (ppm taken as mg/L, and weight % as 10 g/L per %)
+    ('In water, 6,700 ppm at 25 °C', 6.7),
+    ('0.43% (by wt) in water', 4.3),
+    # (NIOSH % is not clearly per what)
+    ('5 % (NIOSH, 2016)', None),
     # (would need the density)
     ('1 ml in 40 ml water', None),
     # In other solvents
@@ -87,8 +93,8 @@ def _pubchem_values(monkeypatch, heading, values):
         {'Value': {'StringWithMarkup': [{'String': v}]} if isinstance(v, str) else v}
         for v in values
     ]
-    monkeypatch.setattr(pp, 'get_second_layer_props',
-        lambda name, props, cid=False: {heading: results}
+    monkeypatch.setattr(cu, 'pubchem_heading_information',
+        lambda cid, h: results if h == heading else []
     )
     monkeypatch.setattr(cu, 'convert', lambda *args, **kwargs: 1)
 

@@ -8,6 +8,7 @@ come from the saved cache.
 """
 
 import os
+import logging
 import sqlite3
 import subprocess
 import sys
@@ -738,3 +739,98 @@ def test_add_properties_to_cache():
     value = cu.inchi2density(inchi)
     assert value['density'] == pytest.approx(0.9)
     assert value['density_units'] == 'g / mL'
+
+
+def test_convert_series_many2one(pubchem, capsys):
+    names = pd.Series(['ethyl acetate', 'acetic acid ethyl ester', 'E2-hexenal'],
+        name='name'
+    )
+    cu.cache['name']['inchi']['acetic acid ethyl ester'] = ethyl_acetate['inchi']
+
+    inchis = cu.convert(names, to_type='inchi')
+    assert list(inchis) == [ethyl_acetate['inchi']] * 2 + [hexenal['inchi']]
+    out = capsys.readouterr().out
+    assert 'multiple name converted to the same inchi' in out
+    assert "['ethyl acetate', 'acetic acid ethyl ester']" in out
+
+    cu.convert(names, to_type='inchi', report_many2one=False)
+    assert capsys.readouterr().out == ''
+
+    with pytest.raises(ValueError, match='multiple name converted'):
+        cu.convert(names, to_type='inchi', check_one2one=True)
+
+    # Inputs that only differ before normalization are not reported.
+    cu.convert(pd.Series(['Ethyl Acetate', 'ethyl acetate'], name='name'),
+        to_type='inchi'
+    )
+    assert capsys.readouterr().out == ''
+
+
+def test_convert_dataframe_priority(pubchem, capsys):
+    # CAS has priority over name
+    cu.cache['name']['inchi']['ethyl acetate'] = 'inchi-from-name'
+    df = pd.DataFrame({'name': ['Ethyl Acetate', 'E2-hexenal'],
+        'cas': ['141-78-6', None]
+    })
+    converted = cu.convert(df, to_type='inchi', used_id_col='inchi_from')
+    assert list(converted.inchi) == [ethyl_acetate['inchi'], hexenal['inchi']]
+    assert list(converted.inchi_from) == ['cas', 'name']
+    # (conflict between name and CAS reported)
+    assert 'conflicting lookup results' in capsys.readouterr().out
+
+
+def test_convert_keep_originals(pubchem):
+    df = pd.DataFrame({'name': ['Ethyl Acetate', 'E2-hexenal']})
+    converted = cu.convert(df, to_type='inchi', keep_originals=True)
+    assert list(converted.orig_name) == list(df.name)
+
+    # (allowed if already there with the same values)
+    df['orig_name'] = df.name
+    assert cu.convert(df, to_type='inchi', keep_originals=True).equals(converted)
+
+    df['orig_name'] = ['x', 'y']
+    with pytest.raises(ValueError, match='orig_name already in columns'):
+        cu.convert(df, to_type='inchi', keep_originals=True)
+
+
+def test_convert_null(pubchem):
+    for null in (None, np.nan):
+        assert cu.isnull(cu.convert(null, from_type='name'))
+    assert pubchem.n_calls() == 0
+
+
+@cu.cached
+def inchi2ignoring_cache(inchi):
+    # (whether the cache is being ignored, inside a cached fn)
+    return cu._ignoring_cache.get()
+
+
+def test_cached_ignore_cache_nested(pubchem):
+    inchi = ethyl_acetate['inchi']
+    assert inchi2ignoring_cache(inchi) == False
+    assert inchi2ignoring_cache(inchi + 'x', ignore_cache=True) == True
+    assert cu._ignoring_cache.get() == False
+
+    # Nested lookups (e.g. of CIDs) also ignore the cache.
+    cu.cache['inchi']['cid'][inchi] = 999999
+    new_process()
+    assert cu.inchi2pubchem_url(inchi).endswith('/999999')
+
+    @cu.cached
+    def inchi2nested_cid(inchi):
+        return cu.convert(inchi, from_type='inchi', to_type='cid')
+
+    new_process()
+    assert inchi2nested_cid(inchi, ignore_cache=True) == 8857
+
+
+def test_logging(capsys):
+    cu.warn('test warning')
+    for handler in cu.logger.handlers:
+        handler.flush()
+
+    assert 'test warning' in cu.log_path.read_text()
+    # (printed with the stack, by `sh`)
+    assert 'test_logging' in capsys.readouterr().out
+    # Not added to the root logger, so other code's logging is not changed.
+    assert cu.sh not in logging.getLogger('').handlers

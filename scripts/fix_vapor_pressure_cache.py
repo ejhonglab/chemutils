@@ -6,16 +6,16 @@ uses PubChem values at or near 25 C (older lookups averaged values at any temper
 PubChem values are downloaded again for the entries selected with --check (by default,
 only non-null, non-manual values). Entries whose value changes are updated, or deleted
 if there is no longer any PubChem value to use (including compounds PubChem no longer
-has any vapor pressure data for). Manually entered values are only changed if 'manual'
-is in --check (then saved as non-manual). Null values (checked if 'nulls' is in --check)
-are updated if there is now a value.
+has any vapor pressure data for). Entries with the same value, but without (or with a
+different) 'vapor_pressure_measured', are also updated. Manually entered values are only
+changed if 'manual' is in --check (then saved as non-manual). Null values (checked if
+'nulls' is in --check) are updated if there is now a value.
 
 Without --write, only reports what would change. With --write, the cache is first backed
 up to <cache path>.<time>.bak
 """
 
 import argparse
-import logging
 import sqlite3
 import time
 
@@ -47,8 +47,8 @@ def main():
     )
     args = parser.parse_args()
 
-    # (warnings, e.g. from strings failing to parse, still go to chemutils.log)
-    logging.getLogger('').removeHandler(cu.sh)
+    # (warnings, e.g. from strings failing to parse, still go to cu.log_path)
+    cu.logger.removeHandler(cu.sh)
 
     def entry_kind(value, manual):
         if cu.isnull(value) or cu.isnull(value['vapor_pressure']):
@@ -112,9 +112,16 @@ def main():
 
         old_kpa = None if cu.isnull(old) else old['vapor_pressure']
         new_kpa = None if new is None else new['vapor_pressure']
-        if error is None and (cu.isnull(old_kpa) and cu.isnull(new_kpa) or (
+        same_value = cu.isnull(old_kpa) and cu.isnull(new_kpa) or (
             not cu.isnull(old_kpa) and not cu.isnull(new_kpa) and
-            np.isclose(old_kpa, new_kpa, rtol=1e-6))):
+            np.isclose(old_kpa, new_kpa, rtol=1e-6)
+        )
+        old_measured = None if cu.isnull(old) else old.get('vapor_pressure_measured')
+        # (null values are left without this key)
+        same_measured = cu.isnull(new_kpa) or (
+            old_measured == new['vapor_pressure_measured']
+        )
+        if error is None and same_value and same_measured:
             continue
 
         if error is not None:
@@ -123,22 +130,25 @@ def main():
             action = 'none (manual)'
         elif cu.isnull(new_kpa):
             action = 'delete'
+        elif same_value:
+            action = 'update (vapor_pressure_measured only)'
         else:
             action = 'update'
 
         if args.write and action == 'delete':
             del sub_cache[inchi]
-        elif args.write and action == 'update':
+        elif args.write and action.startswith('update'):
             sub_cache[inchi] = new
 
         rows.append({'inchi': inchi, 'cid': cid, 'manual': bool(manual),
-            'old_kpa': old_kpa, 'new_kpa': new_kpa, 'action': action,
-            'time': time.strftime('%Y-%m-%d %H:%M:%S')
+            'old_kpa': old_kpa, 'new_kpa': new_kpa,
+            'new_measured': None if new is None else new['vapor_pressure_measured'],
+            'action': action, 'time': time.strftime('%Y-%m-%d %H:%M:%S')
         })
 
-    df = pd.DataFrame(rows,
-        columns=['inchi', 'cid', 'manual', 'old_kpa', 'new_kpa', 'action', 'time']
-    )
+    df = pd.DataFrame(rows, columns=['inchi', 'cid', 'manual', 'old_kpa', 'new_kpa',
+        'new_measured', 'action', 'time'
+    ])
     verb = '' if args.write else 'would be '
     print(f'\nof {len(entries)} checked cached vapor pressures:')
     for action, n in df.action.value_counts().items():

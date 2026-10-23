@@ -39,6 +39,9 @@ name2normalized = {
     # Prefix correction needed after ester/acid reordering
     'ethyl ester g-hydroxybutyric acid': 'gamma-hydroxybutyric acid, ethyl ester',
     '(1S)-(+)-3-carene': '(1s)-(+)-3-carene',
+    # Not stripping the only parenthetical (which used to leave nothing)
+    '(trimethylsilyl)': '(trimethylsilyl)',
+    ' (Trimethylsilyl) (CAS)': '(trimethylsilyl)',
 }
 
 @pytest.mark.parametrize('name,expected', name2normalized.items())
@@ -134,3 +137,12 @@ def test_is_series():
 
     assert cu.isnull(pd.Series({'a': None, 'b': None}))
     assert not cu.isnull(pd.Series({'a': None, 'b': 1.0}))
+    assert cu.isnull(None) and cu.isnull(np.nan)
+    assert not cu.isnull('x')
+    # (arrays are not null, rather than raising ValueError)
+    assert not cu.isnull(np.array([np.nan, np.nan]))
+
+
+@pytest.mark.parametrize('name', ['', '  ', '(CAS)'])
+def test_normalize_name_empty(name):
+    assert cu.normalize_name(name) is None
