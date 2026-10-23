@@ -2526,6 +2526,39 @@ degree_re = r'\s*°\s*([CFK])'
 temp_re = _at_re + float_re + degree_re
 temp_range_re = _at_re + float_range_re + degree_re
 
+# Densities in the 'Density' section of PubChem pages that are not of the compound as a
+# liquid (or solid), e.g. 'Relative density of the vapour/air-mixture at 20 °C (air = 1):
+# 1', 'Density (gas): 1.00045 g/l', 'Bulk density = 6.9 wt/gal', '1.05 at 59 °F for
+# 10.17% weight/weight solution', 'critical density: 0.2734', and conversion factors
+# ('1 MG/L= 278 PPM').
+_not_liquid_density_re = re.compile(
+    r'\b(?:air|vapou?r|gas|gases|critical|bulk|solutions?|conversion|ppm)\b',
+    re.IGNORECASE
+)
+# What may come before a relative density (its value then the first thing after it):
+# 'Density:', 'Relative density (water = 1):', 'Sp gr:', and a temperature, e.g. '(57
+# °F): 0.81'.
+_density_label_re = re.compile(
+    r'^\s*(?:(?:relative\s+)?density|specific\s+gravity|sp\.?\s*gr\.?)?\s*'
+    r'(?:\([^)]*\))?\s*:?\s*',
+    re.IGNORECASE
+)
+# The temperature of the water a relative density is to, e.g. '/4 °C' in '0.876 at
+# 15 °C/4 °C'.
+_relative_to_temp_re = re.compile(r'/\s*-?\d+(?:\.\d+)?\s*°\s*[CF]')
+_cu_cm_re = re.compile(r'[/.]\s*cu\.?\s*cm\b', re.IGNORECASE)
+# Solvents other than water, which solubilities in are not used as water solubilities.
+_other_solvent_re = re.compile(
+    r'\b(?:alcohols?|ethanol|methanol|ethers?|acetone|benzene|chloroform|oils?|'
+    r'glycerol|glycerin|glycols?|hexane|toluene|DMSO|(?:organic\s+)?solvents)\b',
+    re.IGNORECASE
+)
+# An amount in a volume of water, e.g. '2.5 g in 100 mL water', '1 ml in 40 ml water',
+# '1 gram dissolves in 1000 mL water, 80 mL boiling water, 0.8 mL alcohol'.
+_amount_in_volume_re = re.compile(float_re + r'\s*(mg|g|grams?|kg|ml|l)\b[^;]*?\bin\s+'
+    r'(?:about\s+)?' + float_re + r'\s*(ml|l)\b(?:\s+of)?\s+water\b', re.IGNORECASE
+)
+
 def parse_temperature_c(string):
     """Returns None or scalar temparture in celsius and part of string not used.
     """
@@ -2602,29 +2635,78 @@ def parse_pubchemprops_string(string, expected_units=None, target_temp_c=None,
     if ';' in string:
         smallest_diff = None
         data = None
+        # Parts with a value but no stated temperature, e.g. the first of
+        # '1.174 (USCG, 1999) - Denser than water; will sink'
+        undated = []
+        error = None
         for part in string.split(';'):
-            curr_data = parse_pubchemprops_string(part,
-                expected_units=expected_units, target_temp_c=target_temp_c,
-                url=url
-            )
+            try:
+                curr_data = parse_pubchemprops_string(part,
+                    expected_units=expected_units, target_temp_c=target_temp_c,
+                    url=url
+                )
+            # (other parts may still have a value, e.g. the density in
+            # 'DENSITY OF "SATURATED" AIR: ...; 1 MG/L= 408 PPM & 1 PPM= 2.45 MG/CU M')
+            except ValueError as err:
+                if error is None:
+                    error = err
+                continue
+
+            if curr_data['quantity'] is None:
+                continue
+
             curr_temp = curr_data['temperature_c']
             if curr_temp is not None:
                 curr_diff = abs(curr_temp - target_temp_c)
                 if smallest_diff is None or curr_diff < smallest_diff:
                     data = curr_data
                     smallest_diff = curr_diff
+            else:
+                undated.append(curr_data)
+
+        # Only if it is the one value (several without temperatures could be of
+        # different things).
+        if data is None and len(undated) == 1:
+            data = undated[0]
 
         # This coverts strings that have no parseable portions, but still
         # have a semicolon, such as:
         # "Miscible in ethanol, ethyl ether; slightly soluble in carbon
         #  tetrachloride"
         if data is None:
+            if error is not None:
+                raise error
             return null_dict
 
-        assert data['quantity'] is not None
         return data
 
     parsed_dict = {k: None for k in keys_to_parse}
+
+    relative_density = False
+    if expected_units == 'density':
+        if _not_liquid_density_re.search(string):
+            return null_dict
+
+        # The temperature of the water a relative density is to, e.g. '/4 °C' in
+        # '0.876 at 15 °C/4 °C' (as at 4 C water is 1.000 g/mL, and 0.997 g/mL at 25 C,
+        # these are taken as g/mL).
+        string = _relative_to_temp_re.sub('', string)
+
+        # A value with no units, as PubChem's are when relative to water (specific
+        # gravity), e.g. 'Relative density (water = 1): 0.87', '0.868-0.878', or
+        # '0.876 at 68 °F (USCG, 1999) - Less dense than water'.
+        relative_density = bool(re.match(r'\d', _density_label_re.sub('', string, count=1)))
+
+        # e.g. '1.02 g/cm3' (pint parses 'cm³', but not 'cm3')
+        string = re.sub(r'\b(c?m)3\b', r'\1**3', string)
+
+    elif expected_units == 'concentration':
+        # Solubilities in other solvents, e.g. 'Solubility in alcohol: 1 mL in 1 mL 95%
+        # ethanol'
+        if _other_solvent_re.search(string) and not re.search(r'\bwater\b', string,
+            re.IGNORECASE):
+
+            return null_dict
 
     temp_c, string = parse_temperature_c(string)
     if temp_c is not None:
@@ -2638,6 +2720,24 @@ def parse_pubchemprops_string(string, expected_units=None, target_temp_c=None,
 
     # So that we don't have to worry about parsing the years as our quantity.
     string = re.sub(source_re, '', string)
+
+    if expected_units == 'concentration':
+        # e.g. '2.5 g in 100 mL water' (as g/mL), or '1 ml in 40 ml water' (which needs
+        # the density, so is not used)
+        match = _amount_in_volume_re.search(string)
+        if match is not None:
+            amount, amount_unit, volume, volume_unit = match.groups()
+            # (as pint takes e.g. 'ML' to be megaliters)
+            amount_unit, volume_unit = amount_unit.lower(), volume_unit.lower()
+            if not ureg.Quantity(1, amount_unit).check('[mass]'):
+                return null_dict
+
+            parsed_dict['quantity'] = (
+                float(amount.replace(',', '')) / float(volume.replace(',', ''))
+            )
+            parsed_dict['units'] = ureg.parse_units(f'{amount_unit} / {volume_unit}')
+            parsed_dict['from_range'] = False
+            return parsed_dict
 
     quantity = None
 
@@ -2664,9 +2764,8 @@ def parse_pubchemprops_string(string, expected_units=None, target_temp_c=None,
     # format (e.g. '1.5 [mmHg]'.
     string = string.replace('[mmHg]', 'mmHg').replace('[mm Hg]', 'mmHg')
 
-    # TODO maybe use regex for this. implement more general correctly handling
-    # somewhere else? didn't i already have one hack for something like this?
-    string = string.replace('/cu cm', '/mL')
+    # e.g. '1.0446 g/cu cm', and '1.0328 g.cu cm' (a typo on one PubChem page)
+    string = _cu_cm_re.sub('/mL', string)
 
     # Assuming we can remove all parenthetical stuff that remains
     # (source was already parsed and removed above) without issue. Also removes empty
@@ -2822,8 +2921,18 @@ def parse_pubchemprops_string(string, expected_units=None, target_temp_c=None,
 
             raise ValueError(err_msg)
 
+    if units is None and relative_density:
+        units = ureg.parse_units('g / mL')
+
     # One case that triggers this: "2 % (NIOSH, 2016)"
     if units is None:
+        return null_dict
+
+    # Densities of a gas, e.g. '1.639 g/L' (hydrogen chloride's), as no liquid or solid
+    # is this light.
+    if (expected_units == 'density' and
+        ureg.Quantity(quantity, units).to('g / mL').magnitude < 0.1):
+
         return null_dict
 
     # Since the measurement / reporting probably just doesn't have enough
@@ -3006,7 +3115,8 @@ def pubchemprops_lookup(inchi, prop_name, expected_units=None,
             # `temp_c` can be `None`, but that will just overwrite w/ existing value.
             parsed_dict['temperature_c'] = temp_c
 
-            unit_str = unit_str.replace('()','').strip()
+            # (as for strings above, e.g. '(68 °F)' left of 'g/l at 20 °C (68 °F)')
+            unit_str = re.sub(r'\(.*\)', '', unit_str).strip()
 
             # This is to special case one instance where the unit_str was 'mg/mL, clear,
             # colorless'. Probably no cases where I want everything surrounding a comma,
@@ -3017,13 +3127,27 @@ def pubchemprops_lookup(inchi, prop_name, expected_units=None,
                     ' info following comma failed'
                 )
 
-            units = ureg(unit_str)
-            assert in_expected_units(expected_units, units)
+            unit_str = _cu_cm_re.sub('/mL', unit_str)
+            # e.g. 'g/100 mL' as g/(100 mL) (pint would take it as g/100 * mL)
+            unit_str = re.sub(r'/\s*(\d+(?:\.\d+)?)\s*([a-zA-Z]+)', r'/(\1 \2)', unit_str)
+            try:
+                # (a Quantity, so that any scaling factor is kept, e.g. 'g/100 mL')
+                units = ureg.Quantity(unit_str)
+            except Exception:
+                units = None
+
+            if units is None or not in_expected_units(expected_units, units):
+                err_msg = f'{url}\nunexpected units: {value_dict}'
+                if skip_unit_parse_err:
+                    warn(err_msg)
+                    continue
+                raise ValueError(err_msg)
+
             parsed_dict['units'] = units.u
 
             nums = value_dict['Number']
             assert len(nums) == 1
-            parsed_dict['quantity'] = nums[0]
+            parsed_dict['quantity'] = nums[0] * units.magnitude
 
             parsed_dict['from_range'] = False
 
@@ -3136,8 +3260,11 @@ def pubchemprops_lookup(inchi, prop_name, expected_units=None,
             assert len(value_dict['StringWithMarkup']) == 1
             # If there is an extra Key under the first element, it seems to have always
             # just been a reference to water...
+        # e.g. {'Binary': [...], 'MimeType': 'text/csv'}, a table (as for hydrogen
+        # chloride's density)
         else:
-            raise ValueError(f'{url}\nunexpected value dict')
+            warn(f'{url}\nskipping value without a number or string: {sorted(value_dict)}')
+            continue
 
     if len(parsed_dicts) == 0:
         # TODO delete
@@ -3264,7 +3391,7 @@ def inchi2water_solubility(inchi, verbose=False):
 
     # TODO also pass ignore_cache added by `cached` through so it's usable here?
     ret = pubchemprops_lookup(inchi, 'Solubility',
-        expected_units='concentration', verbose=verbose
+        expected_units='concentration', skip_unit_parse_err=True, verbose=verbose
     )
     if ret is None:
         return pd.Series({k: None for k in ret_keys})
@@ -3733,13 +3860,19 @@ def inchi2chemspider_url(inchi, **kwargs):
 #@opt_pint_return
 @cached
 def inchi2density(inchi, verbose=False):
+    """Returns mean PubChem density [g/mL] of the compound (else ChemSpider's, if
+    `chemspipy_api_key` is set).
+
+    PubChem's relative densities (to water, as most of its values are) are taken as g/mL
+    (water is 0.997-1.000 g/mL from 4-25 C). Densities of the vapor, of air saturated
+    with it, of solutions and bulk densities are not used, nor are strings that cannot be
+    parsed (with a warning).
+    """
     ret_keys = ['density', 'density_sources', 'density_units']
     null_ret = pd.Series({k: None for k in ret_keys})
 
-    # TODO is this going to be in consistent units? convert?
-    # pass expected_units?
     pubchem_dict = pubchemprops_lookup(inchi, 'Density',
-        expected_units='density', verbose=verbose
+        expected_units='density', skip_unit_parse_err=True, verbose=verbose
     )
     if pubchem_dict is not None:
         return pd.Series({

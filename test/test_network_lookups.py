@@ -89,14 +89,7 @@ def in_range(prop, units, low, high):
         in_range('water_solubility', 'g / L', 50, 120)
     ),
     # ~0.90 g/mL
-    pytest.param('inchi2density', inchi, f'InChI={inchi}',
-        in_range('density', 'g / mL', 0.85, 0.95),
-        # pubchemprops_lookup gives 0.9003 g/mL with skip_unit_parse_err=True, but
-        # inchi2density does not pass that, so it raises.
-        marks=pytest.mark.xfail(raises=ValueError, strict=True, reason='parsing of '
-            'PubChem string "CONVERSION FACTORS: 1 MG/L= 278 PPM" raises ValueError'
-        )
-    ),
+    ('inchi2density', inchi, f'InChI={inchi}', in_range('density', 'g / mL', 0.85, 0.95)),
     # ~6-9 mol/(kg*bar)
     ('inchi2nist_k_henry', inchi, f'InChI={inchi}',
         in_range('k_henry', 'mol / kg / bar', 3, 15)
