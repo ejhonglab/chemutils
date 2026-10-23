@@ -55,7 +55,8 @@ python scripts/fix_vapor_pressure_cache.py --check values manual nulls          
 python scripts/fix_vapor_pressure_cache.py --check values manual nulls --write
 ```
 Changes this made to the cache it was first run on (2026-10-23) are listed in
-[cache_changes/2026-10-23_vapor_pressure.md](cache_changes/2026-10-23_vapor_pressure.md).
+[cache_changes/](cache_changes/) (first re-computing with only values at or near 25 C,
+then with estimates only used if there are no measurements).
 
 ### Tests
 Tests use a temporary cache (never the one above). Tests that need internet access are
