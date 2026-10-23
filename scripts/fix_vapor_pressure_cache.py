@@ -21,9 +21,13 @@ import time
 
 import numpy as np
 import pandas as pd
+import requests
 
 import chemutils as cu
 
+
+# Times to try each lookup PubChem responds to with 429 (Too Many Requests).
+max_tries = 4
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
@@ -38,6 +42,9 @@ def main():
         help='update / delete changed entries (otherwise only reports them)'
     )
     parser.add_argument('-r', '--report', help='also write report to this CSV')
+    parser.add_argument('-i', '--inchis', metavar='CSV', help="only check entries for "
+        "InChIs in the 'inchi' column of this CSV (e.g. failed lookups from a report)"
+    )
     args = parser.parse_args()
 
     # (warnings, e.g. from strings failing to parse, still go to chemutils.log)
@@ -48,10 +55,14 @@ def main():
             return 'nulls'
         return 'manual' if manual else 'values'
 
+    inchis = None
+    if args.inchis is not None:
+        inchis = set(pd.read_csv(args.inchis).inchi)
+
     conn = cu._get_conn()
     entries = [(inchi, value, manual) for _, _, inchi, value, manual in
         cu._iter_entries(conn, 'inchi', 'vapor_pressure')
-        if entry_kind(value, manual) in args.check
+        if entry_kind(value, manual) in args.check and (inchis is None or inchi in inchis)
     ]
     print(f'checking {len(entries)} cached vapor pressures ({", ".join(args.check)})')
 
@@ -74,13 +85,25 @@ def main():
         cid = inchi2cid.get(inchi)
         start = time.time()
         new = None
-        error = None
-        try:
-            new = lookup(inchi)
-        # (so one failure, e.g. from new PubChem data the parsing can't handle, doesn't
-        # stop the rest)
-        except Exception as err:
-            error = f'{type(err).__name__}: {err}'
+        for n_tries in range(1, max_tries + 1):
+            error = None
+            try:
+                new = lookup(inchi)
+                break
+
+            except requests.HTTPError as err:
+                error = f'{type(err).__name__}: {err}'
+                # PubChem throttling requests (e.g. if others are also using it)
+                if err.response is None or err.response.status_code != 429:
+                    break
+                if n_tries < max_tries:
+                    time.sleep(10 * 2**n_tries)
+
+            # (so one failure, e.g. from new PubChem data the parsing can't handle,
+            # doesn't stop the rest)
+            except Exception as err:
+                error = f'{type(err).__name__}: {err}'
+                break
 
         # PubChem asks for at most 5 requests per second. (lookups without a CID don't
         # make any requests)

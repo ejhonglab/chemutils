@@ -50,6 +50,8 @@ re-compute them with only values at or near 25 C (the cache is backed up first):
 python scripts/fix_vapor_pressure_cache.py --check values manual nulls          # to see what will change
 python scripts/fix_vapor_pressure_cache.py --check values manual nulls --write
 ```
+Changes this made to the cache it was first run on (2026-10-23) are listed in
+[cache_changes/2026-10-23_vapor_pressure.md](cache_changes/2026-10-23_vapor_pressure.md).
 
 ### Tests
 Tests use a temporary cache (never the one above). Tests that need internet access are
