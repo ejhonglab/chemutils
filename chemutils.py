@@ -2662,15 +2662,16 @@ def parse_pubchemprops_string(string, expected_units=None, target_temp_c=None,
     # This is to fix a common sorce of vapor pressure measurements
     # (https://haz-map.com), which seems to have all of its data in PubChem in this
     # format (e.g. '1.5 [mmHg]'.
-    string = string.replace('[mmHg]', 'mmHg')
+    string = string.replace('[mmHg]', 'mmHg').replace('[mm Hg]', 'mmHg')
 
     # TODO maybe use regex for this. implement more general correctly handling
     # somewhere else? didn't i already have one hack for something like this?
     string = string.replace('/cu cm', '/mL')
 
     # Assuming we can remove all parenthetical stuff that remains
-    # (source was already parsed and removed above) without issue.
-    string = re.sub(r'\(.+\)', '', string)
+    # (source was already parsed and removed above) without issue. Also removes empty
+    # parentheses left after removing temperature, e.g. from '11 mmHg (@ 77 °F)'.
+    string = re.sub(r'\(.*\)', '', string)
 
     parts = string.strip().split()
 
@@ -2842,6 +2843,67 @@ def parse_pubchemprops_string(string, expected_units=None, target_temp_c=None,
     return parsed_dict
 
 
+_num_re = r'(-?\d+(?:\.\d+)?)'
+# Temperatures (or ranges of them) in the formats PubChem vapor pressure strings use,
+# e.g. 'at 25 °C', '(77°F)', '68° F', '-1.5 °C', '294 deg K', '300 K', '20-25 °C'
+_stated_temp_re = re.compile(_num_re + rf'(?:\s*(?:-|to)\s*{_num_re})?'
+    r'\s*(?:(?:°|deg)\s*([CFK])|(K))\b'
+)
+# Number after 'at' / '@' (once stated temperatures are removed), which may be a
+# temperature without units (e.g. '0.0135 mm Hg at 25 /extrapolated/').
+_unitless_temp_re = re.compile(r'(?:\bat|@)\s*-?\d', re.IGNORECASE)
+
+def _stated_temps_c(string: str) -> Optional[list]:
+    """Returns temperatures [C] stated in `string`, including both ends of ranges.
+
+    Returns None if there may also be a temperature without units.
+    """
+    temps_c = []
+    for match in _stated_temp_re.finditer(string):
+        low, high, unit_str, kelvin = match.groups()
+        unit = ureg.degK if kelvin else degree_str2unit(unit_str)
+        for temp in (low, high):
+            if temp is not None:
+                temps_c.append(ureg.Quantity(float(temp), unit).to(ureg.degC).magnitude)
+
+    if _unitless_temp_re.search(_stated_temp_re.sub('', string)):
+        return None
+
+    return temps_c
+
+
+def _pubchemprops_temp_rank(part: str, string: str, target_temp_c: float,
+    max_temp_diff_c: float) -> Optional[tuple]:
+    """Returns rank of value in `part` of PubChem `string`, by temperature and source.
+
+    Lower ranks are preferred. Values stated at temperatures within 1 C of
+    `target_temp_c` are preferred to those within `max_temp_diff_c`, which are preferred
+    to those with no stated temperature. NTP values are ranked below all others (for 3
+    of 28 compounds with NTP and other vapor pressures at 25 C, NTP's were >10x off).
+
+    Returns None if the value should not be used: any temperature stated is more than
+    `max_temp_diff_c` from `target_temp_c` (or may be stated without units), or no
+    temperature is stated and the value is from USCG (most of which were well above
+    other values at 25 C).
+    """
+    temps_c = _stated_temps_c(part)
+    if temps_c is None:
+        return None
+
+    if len(temps_c) == 0:
+        if 'USCG' in string:
+            return None
+        temp_rank = 2
+    else:
+        max_diff = max(abs(t - target_temp_c) for t in temps_c)
+        if max_diff > max_temp_diff_c:
+            return None
+        temp_rank = 0 if max_diff <= 1 else 1
+
+    # (NTP strings can have several values, with source only after the last)
+    return ('NTP' in string, temp_rank)
+
+
 # TODO delete
 # str -> dict
 _str_parsings = dict()
@@ -2856,11 +2918,22 @@ _had_num_lookup = set()
 _had_str_lookup = set()
 #
 def pubchemprops_lookup(inchi, prop_name, expected_units=None,
-    target_temp_c=None, skip_unit_parse_err=False, verbose=False):
+    target_temp_c=None, max_temp_diff_c=None, skip_unit_parse_err=False,
+    verbose=False):
     # TODO TODO doc whether this averages over sources / how it picks one / etc
     """
     Requires my fork of pubchemprops which adds the `cid` kwarg to
     `get_second_layer_props`.
+
+    Args:
+        target_temp_c: for strings with values at several temperatures, the value at the
+            temperature closest to this is used (default 25 C).
+
+        max_temp_diff_c: if not None, only values stated to be within this many C of
+            `target_temp_c` are used, and values with no stated temperature are only
+            used if there are none of those (see `_pubchemprops_temp_rank` for
+            details). All values in strings with several are considered. Values for
+            solutions are also not used.
     """
     # TODO TODO still err if *no* strings can be parsed successfully, even if
     # skip_unit_parse_err=True (or some other value for that?)
@@ -2922,6 +2995,13 @@ def pubchemprops_lookup(inchi, prop_name, expected_units=None,
             # parsing logic above here?
             unit_str = value_dict['Unit']
 
+            if max_temp_diff_c is not None:
+                parsed_dict['temp_rank'] = _pubchemprops_temp_rank(unit_str, unit_str,
+                    target_temp_c, max_temp_diff_c
+                )
+                if parsed_dict['temp_rank'] is None:
+                    continue
+
             temp_c, unit_str = parse_temperature_c(unit_str)
             # `temp_c` can be `None`, but that will just overwrite w/ existing value.
             parsed_dict['temperature_c'] = temp_c
@@ -2978,56 +3058,80 @@ def pubchemprops_lookup(inchi, prop_name, expected_units=None,
                 )
                 continue
 
-            if verbose:
-                print(f'trying to parse "{pstr}"')
+            if max_temp_diff_c is None:
+                parts = [pstr]
+            else:
+                if 'solution' in pstr:
+                    continue
+                # (rather than letting parse_pubchemprops_string pick the value
+                # closest to target_temp_c, so all within range can be used)
+                parts = pstr.split(';')
 
-            try:
-                parsed_dict = parse_pubchemprops_string(pstr,
-                    expected_units=expected_units, target_temp_c=target_temp_c,
-                    url=url
-                )
+            for part in parts:
+                temp_rank = None
+                if max_temp_diff_c is not None:
+                    temp_rank = _pubchemprops_temp_rank(part, pstr, target_temp_c,
+                        max_temp_diff_c
+                    )
+                    if temp_rank is None:
+                        if verbose:
+                            print(f'excluding "{part}" (temperature may not be within '
+                                f'{max_temp_diff_c} C of {target_temp_c} C)'
+                            )
+                        continue
 
-            # ValueError: multiple unit definitions. remaining:...
-            # TODO TODO be more clear about what is happening here
-            except ValueError as err:
-                # TODO delete
-                # TODO include the specific error message alongside?
-                if inchi in _parse_failures1:
-                    if pstr not in _parse_failures1:
-                        _parse_failures1[inchi].append(pstr)
-                else:
-                    _parse_failures1[inchi] = [pstr]
-                #
-                if skip_unit_parse_err:
-                    warn(str(err))
+                if verbose:
+                    print(f'trying to parse "{part}"')
+
+                try:
+                    parsed_dict = parse_pubchemprops_string(part,
+                        expected_units=expected_units, target_temp_c=target_temp_c,
+                        url=url
+                    )
+
+                # ValueError: multiple unit definitions. remaining:...
+                # TODO TODO be more clear about what is happening here
+                except ValueError as err:
+                    # TODO delete
+                    # TODO include the specific error message alongside?
+                    if inchi in _parse_failures1:
+                        if part not in _parse_failures1:
+                            _parse_failures1[inchi].append(part)
+                    else:
+                        _parse_failures1[inchi] = [part]
+                    #
+                    if skip_unit_parse_err:
+                        warn(str(err))
+                        continue
+                    else:
+                        raise
+
+                if verbose:
+                    print(f'parsed: {pformat(parsed_dict)}')
+
+                # TODO TODO why would parse_pubchemprops_string not just err in this
+                # case? is this actually happening? (modify it so it does, and in all
+                # other cases it is effectively returning nothing (`null_dict`))
+                if parsed_dict['quantity'] is None:
+                    # TODO delete
+                    if inchi in _parse_failures2:
+                        if part not in _parse_failures2:
+                            _parse_failures2[inchi].append(part)
+                    else:
+                        _parse_failures2[inchi] = [part]
+                    #
                     continue
                 else:
-                    raise
+                    parsed_dict['temp_rank'] = temp_rank
+                    parsed_dicts.append(parsed_dict)
 
-            if verbose:
-                print(f'parsed: {pformat(parsed_dict)}')
-
-            # TODO TODO why would parse_pubchemprops_string not just err in this case?
-            # is this actually happening? (modify it so it does, and in all other cases
-            # it is effectively returning nothing (`null_dict`))
-            if parsed_dict['quantity'] is None:
-                # TODO delete
-                if inchi in _parse_failures2:
-                    if pstr not in _parse_failures2:
-                        _parse_failures2[inchi].append(pstr)
-                else:
-                    _parse_failures2[inchi] = [pstr]
-                #
-                continue
-            else:
-                parsed_dicts.append(parsed_dict)
-
-                # TODO delete
-                _had_str_lookup.add(inchi)
-                # copying so that when we mutate dict to change units below, we still
-                # have original units here (which is what we want to check the parsing)
-                _str_parsings[pstr] = dict(parsed_dict)
-                #
+                    # TODO delete
+                    _had_str_lookup.add(inchi)
+                    # copying so that when we mutate dict to change units below, we
+                    # still have original units here (which is what we want to check
+                    # the parsing)
+                    _str_parsings[part] = dict(parsed_dict)
+                    #
 
             assert len(value_dict['StringWithMarkup']) == 1
             # If there is an extra Key under the first element, it seems to have always
@@ -3041,6 +3145,10 @@ def pubchemprops_lookup(inchi, prop_name, expected_units=None,
             _total_failures.add(inchi)
         #
         return None
+
+    if max_temp_diff_c is not None:
+        best_rank = min(d['temp_rank'] for d in parsed_dicts)
+        parsed_dicts = [d for d in parsed_dicts if d['temp_rank'] == best_rank]
 
     # TODO maybe consider this earlier to not continue parsing
     # anything that seems like a range if we already have non-range data
@@ -3172,6 +3280,8 @@ def inchi2water_solubility(inchi, verbose=False):
     })
 
 
+vapor_pressure_temp_c = 25.0
+
 #@opt_pint_return
 @cached
 # TODO include skip_unit_parse_err in wrapper to be applied to other fns using
@@ -3182,6 +3292,13 @@ def inchi2water_solubility(inchi, verbose=False):
 # TODO available in SDF files from pubchem? python library to parse those?
 # (even if so, i doubt it's in an easier to parse format...)
 def inchi2vapor_pressure(inchi, skip_unit_parse_err=True, verbose=False):
+    """Returns mean PubChem vapor pressure [kPa] at (or near) 25 C.
+
+    Only values stated to be within 5 C of 25 C are used, preferring those within 1 C.
+    If there are none, values with no stated temperature are used (except USCG
+    values). NTP values are only used if there are no others. See
+    `_pubchemprops_temp_rank` for details.
+    """
     ret_keys = [
         'vapor_pressure',
         'vapor_pressure_sources',
@@ -3191,6 +3308,7 @@ def inchi2vapor_pressure(inchi, skip_unit_parse_err=True, verbose=False):
     # ALL fail parsing (-> fix parsing for those cases).
     # TODO TODO TODO +count/report number of such cases
     ret = pubchemprops_lookup(inchi, 'Vapor Pressure', expected_units='kPa',
+        target_temp_c=vapor_pressure_temp_c, max_temp_diff_c=5.0,
         skip_unit_parse_err=skip_unit_parse_err, verbose=verbose
     )
     # TODO delete (after experimenting w/ some more direct pubchem/rest/etc calls)
@@ -3470,7 +3588,7 @@ def inchi2est_vapor_pressure(inchi, temp_c: float = 25.0, verbose: bool = False
     `temp_c` is that of the subcooled liquid (higher than that of the solid).
 
     Compared to PubChem values stated at 25 C (scripts/validate_est_vapor_pressure.py),
-    the median error was ~2x (65% of 371 compounds within 3x, and 89% within 10x).
+    the median error was ~2x (65% of 384 compounds within 3x, and 88% within 10x).
     Errors were lower for simple aliphatic esters, aldehydes, ketones, alcohols, and
     hydrocarbons (often within 1.5x), but these were typically underestimated:
     - furans: ~10x

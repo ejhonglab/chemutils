@@ -3,13 +3,14 @@
 Compares `chemutils.inchi2est_vapor_pressure` (SIMPOL.1) estimates at 25 C to the vapor
 pressures of all compounds with non-null cached `inchi2vapor_pressure` outputs.
 
-Cached `inchi2vapor_pressure` values are the mean of all PubChem values for a compound,
-measured at any temperature, so many are well above the vapor pressure at 25 C. With
---pubchem-25c, PubChem values are downloaded again for the same compounds, and only
-values stated to be at 25 C (and not estimated / extrapolated) are used. The median is
-taken across sources, ignoring NTP values (which are often far off) unless they are the
-only ones. Downloaded values are saved to (and re-used from) the JSON file passed to
-that option.
+Cached `inchi2vapor_pressure` values are the mean of PubChem values near 25 C (or with no
+stated temperature, if there are none), unless cached by older versions, which used
+values at any temperature (see scripts/fix_vapor_pressure_cache.py). With --pubchem-25c,
+PubChem values are downloaded again for the same compounds, and only values stated to be
+within 0.5 C of 25 C (and not estimated / extrapolated) are used. The median is taken
+across sources, ignoring NTP values (which are often far off) unless they are the only
+ones. Downloaded values are saved to (and re-used from) the JSON file passed to that
+option.
 """
 
 import argparse
