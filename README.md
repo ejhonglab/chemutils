@@ -44,6 +44,13 @@ python scripts/migrate_cache.py --dry-run   # to see what will change
 python scripts/migrate_cache.py
 ```
 
+Vapor pressures cached by older versions averaged PubChem values at any temperature. To
+re-compute them with only values at or near 25 C (the cache is backed up first):
+```
+python scripts/fix_vapor_pressure_cache.py --check values manual nulls          # to see what will change
+python scripts/fix_vapor_pressure_cache.py --check values manual nulls --write
+```
+
 ### Tests
 Tests use a temporary cache (never the one above). Tests that need internet access are
 marked `network`. To skip those: `pytest -m "not network"`.
