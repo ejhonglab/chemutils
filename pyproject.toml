@@ -25,6 +25,10 @@ dependencies = [
     "lxml",
     # My fork, which adds the `cid` kwarg to `get_second_layer_props`
     "pubchemprops @ git+https://github.com/tom-f-oconnell/pubchemprops",
+    # For inchi2k_henry_pfo (ugropy for UNIFAC groups of compounds not in DDBST's group
+    # assignments, which are bundled with thermo)
+    "thermo",
+    "ugropy",
 ]
 
 [project.optional-dependencies]

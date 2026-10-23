@@ -32,6 +32,13 @@ supports. To compare its estimates to PubChem values:
 python scripts/validate_est_vapor_pressure.py --pubchem-25c pubchem_vp_strings.json
 ```
 
+### Henry's law constants in paraffin oil
+`cu.inchi2k_henry_pfo` estimates Henry's law solubility constants in paraffin oil (pfo),
+in the same units as `cu.inchi2k_henry` values from henrys-law.org (mol / m^3 / Pa), with
+modified UNIFAC in an n-alkane surrogate for the oil (as `oil_headspace.py` does). No
+measured solubilities in oil or alkanes are used unless passed in, and the
+`k_henry_pfo_method` and `k_henry_pfo_measured_partitioning` outputs say which was used.
+
 ### Cache
 Lookup results are cached in an SQLite database at `~/.chemutils_cache.sqlite` (set the
 `CHEMUTILS_CACHE` environment variable to use another path). Input IDs are normalized

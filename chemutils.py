@@ -4488,6 +4488,351 @@ def inchi2k_henry(inchi, verbose=False, **kwargs):
     return ret
 
 
+gas_constant = 8.314462618  # J / (mol K)
+# n-alkanes used as surrogates for paraffin oil (pfo) in inchi2k_henry_pfo, by CAS
+pfo_surrogate_cas = {'hexadecane': '544-76-3', 'squalane': '111-01-3'}
+# thermo vapor pressure methods that are estimates (rather than fit to measurements)
+_thermo_estimated_psat_methods = {'BOILING_CRITICAL', 'LEE_KESLER_PSAT', 'AMBROSE_WALTON',
+    'SANJARI', 'EDALAT', 'EOS'
+}
+_thermo_estimated_tm_methods = {'JOBACK'}
+
+pfo_unifac_method = 'UNIFAC estimate (no measured solubility in oil or alkanes used)'
+pfo_log_k_method = 'measured log10 K oil/air (passed in)'
+pfo_abraham_l_method = 'Abraham L (passed in; log10 K hexadecane/air at 25 C)'
+
+# (temp_k, solvent) -> (molar density [mol/m^3], UNIFAC groups)
+_pfo_surrogates = dict()
+
+def _pfo_surrogate(solvent: str, temp_k: float) -> tuple:
+    """Returns molar density [mol / m^3] and UNIFAC groups of oil surrogate `solvent`.
+    """
+    from chemicals.identifiers import search_chemical
+    from thermo import Chemical
+    from thermo import unifac
+
+    key = (solvent, temp_k)
+    if key not in _pfo_surrogates:
+        cas = pfo_surrogate_cas[solvent]
+        unifac.load_group_assignments_DDBST()
+        groups = dict(unifac.DDBST_MODIFIED_UNIFAC_assignments[
+            search_chemical(cas).InChI_key
+        ])
+        molar_volume = Chemical(cas, T=temp_k).VolumeLiquid(temp_k, 101325)
+        _pfo_surrogates[key] = (1 / molar_volume, groups)
+
+    return _pfo_surrogates[key]
+
+
+def _thermo_search(inchikey: str):
+    """Returns `chemicals` metadata for compound with `inchikey`, or None if not found.
+    """
+    from chemicals.identifiers import search_chemical
+    try:
+        return search_chemical(f'InChIKey={inchikey}')
+    except ValueError:
+        return None
+
+
+def _unifac_groups(inchikey: str, smiles: str) -> tuple:
+    """Returns modified UNIFAC (Dortmund) groups and where they are from.
+
+    Groups are DDBST's published assignments (bundled with thermo) where available,
+    otherwise from ugropy. Groups are None if neither has any.
+    """
+    from thermo import unifac
+
+    unifac.load_group_assignments_DDBST()
+    table = unifac.DDBST_MODIFIED_UNIFAC_assignments
+    if inchikey in table:
+        return dict(table[inchikey]), 'DDBST'
+
+    # Same skeleton (e.g. other stereoisomers). Groups don't depend on stereochemistry.
+    prefix = inchikey.split('-')[0] + '-'
+    matches = sorted(k for k in table if k.startswith(prefix))
+    if len(matches) > 0:
+        match = next((k for k in matches if k.endswith('-UHFFFAOYSA-N')), matches[0])
+        return dict(table[match]), f'DDBST (for {match}, same skeleton)'
+
+    from ugropy import dortmund
+
+    try:
+        groups = dortmund.get_groups(smiles, 'smiles').subgroups_num
+    # (ugropy can fail many ways on unusual structures)
+    except Exception as err:
+        return None, f'ugropy failed ({err})'
+
+    if not groups:
+        return None, 'ugropy found no complete Dortmund fragmentation'
+
+    return {int(k): int(v) for k, v in groups.items()}, 'ugropy (automatic)'
+
+
+def _pfo_vapor_pressure(inchi, chemical, temp_k: float, solid: Optional[bool]
+    ) -> tuple:
+    """Returns liquid vapor pressure [Pa] (or None), source, and whether measured.
+
+    For compounds solid at `temp_k`, this is the subcooled liquid vapor pressure, so
+    PubChem values (which would be of the solid) are not used for them.
+    """
+    psat = None
+    estimated_psat = None
+    if chemical is not None:
+        try:
+            psat = chemical.VaporPressure(temp_k)
+        # (thermo raises various errors outside a method's valid range)
+        except Exception:
+            psat = None
+
+        if psat is not None and psat > 0:
+            method = chemical.VaporPressure.method
+            source = f'thermo {method}'
+            if method not in _thermo_estimated_psat_methods:
+                return psat, source, True
+            estimated_psat = (psat, source)
+
+    temp_c = temp_k - 273.15
+    if abs(temp_c - vapor_pressure_temp_c) <= 1 and not solid:
+        ret = inchi2vapor_pressure(inchi)
+        if not isnull(ret['vapor_pressure']):
+            psat = ureg.Quantity(ret['vapor_pressure'], ret['vapor_pressure_units']
+                ).to('Pa').magnitude
+            return psat, f'PubChem ({ret["vapor_pressure_sources"]})', True
+
+    if estimated_psat is not None:
+        return (*estimated_psat, False)
+
+    ret = inchi2est_vapor_pressure(inchi, temp_c=temp_c)
+    if not isnull(ret['vapor_pressure']):
+        psat = ureg.Quantity(ret['vapor_pressure'], ret['vapor_pressure_units']
+            ).to('Pa').magnitude
+        return psat, ret['vapor_pressure_sources'], False
+
+    return None, None, None
+
+
+def inchi2k_henry_pfo(inchi, temp_c: float = 25.0, solvent: str = 'hexadecane',
+    log_k_oil_air: Optional[float] = None, abraham_l: Optional[float] = None,
+    vapor_pressure_kpa: Optional[float] = None, verbose: bool = False) -> pd.Series:
+    """Returns estimated Henry's law solubility constant in paraffin oil (pfo).
+
+    Estimated as in oil_headspace.py: the oil/air partition coefficient
+    K = C_oil / C_air = c_solv * R * T / (gamma_inf * p_sat), where gamma_inf is the
+    infinite-dilution activity coefficient in an n-alkane surrogate for the oil, from
+    modified UNIFAC (Dortmund), c_solv is the surrogate's molar density, and p_sat is the
+    solute's (subcooled) liquid vapor pressure. The returned constant is
+    C_oil / p = K / (R T), in mol / m^3 / Pa. This is the same definition (and units) as
+    `inchi2k_henry` values from henrys-law.org (for water, the solvent there). Its NIST
+    values are in mol / kg / bar (~100x larger in water than mol / m^3 / Pa).
+
+    No measured solubilities or partition coefficients in oil or alkanes (e.g. in
+    squalane or hexadecane) are used, unless passed in (see `log_k_oil_air` and
+    `abraham_l`). gamma_inf is predicted by UNIFAC from the solute's functional groups
+    alone ('squalane' and 'hexadecane' are UNIFAC models of those solvents, not data for
+    them). UNIFAC's group interaction parameters were fit to measurements on many
+    compounds (possibly including the solute), but no measurements for the particular
+    solute are used. The 'k_henry_pfo_method' and 'k_henry_pfo_measured_partitioning'
+    outputs say which was used for each compound.
+
+    For simple functional groups, UNIFAC K is typically within ~2x of measured values
+    (for 10 simple compounds with measured Abraham L, hexadecane log10 K estimates were
+    within 0.26 of it, median 0.06). Carboxylic acids (which dimerize) are less certain, and
+    solutes that self-associate (e.g. alcohols) are less soluble than predicted at
+    higher concentrations. Vapor pressures estimated with SIMPOL.1 can be biased for some
+    classes (see `inchi2est_vapor_pressure`), which biases K by the same factor.
+
+    UNIFAC groups are DDBST's published assignments (bundled with thermo) where
+    available, otherwise from ugropy.
+
+    Args:
+        temp_c: temperature [C].
+
+        solvent: n-alkane surrogate for the oil ('hexadecane' or 'squalane'). The two
+            typically give log10 K within ~0.2 of each other.
+
+        log_k_oil_air: measured log10 K (C_oil / C_air) for paraffin oil at `temp_c`. If
+            passed, it is used instead of the UNIFAC estimate.
+
+        abraham_l: Abraham L solute descriptor (log10 K hexadecane/air at 25 C, e.g. from
+            the UFZ-LSER database), used instead of the UNIFAC estimate if passed (and
+            `log_k_oil_air` is not). Not corrected for temperature.
+
+        vapor_pressure_kpa: liquid (or subcooled liquid) vapor pressure at `temp_c`, for
+            the UNIFAC estimate. Otherwise, in order of preference: from thermo's fits to
+            measurements, from PubChem (`inchi2vapor_pressure`, only at 25 C, and not
+            for compounds thermo has as solid), estimated by thermo, or estimated by
+            SIMPOL.1 (`inchi2est_vapor_pressure`). PubChem values for compounds that are
+            solid (but that thermo has no melting point for) would be of the solid, and
+            would make K too high.
+
+        verbose: if True, prints the returned values.
+
+    Returns:
+        Series with:
+        - 'k_henry_pfo', 'k_henry_pfo_sources', 'k_henry_pfo_units': as for
+          `inchi2k_henry` (with sources describing everything the value depends on).
+        - 'k_henry_pfo_method': one of `pfo_unifac_method`, `pfo_log_k_method`, or
+          `pfo_abraham_l_method`.
+        - 'k_henry_pfo_measured_partitioning': whether measured partitioning between
+          oil (or an alkane) and air was used (only if passed in).
+        - 'log10_k_oil_air': log10 of the oil/air partition coefficient K.
+        - 'solvent_surrogate', 'gamma_inf', 'unifac_groups', 'unifac_groups_source',
+          'unifac_parameters': for UNIFAC estimates.
+        - 'vapor_pressure_kpa', 'vapor_pressure_source', 'vapor_pressure_measured': the
+          vapor pressure used for UNIFAC estimates, and whether it is from measurements.
+        - 'notes': caveats for this compound.
+
+        Values are null (with the reason in 'notes') if K could not be estimated.
+    """
+    # (imported here, as importing thermo takes ~0.5s)
+    from thermo import Chemical
+    from thermo import unifac
+
+    temp_k = temp_c + 273.15
+    ret = {k: None for k in ('k_henry_pfo', 'k_henry_pfo_sources', 'k_henry_pfo_units',
+        'k_henry_pfo_method', 'k_henry_pfo_measured_partitioning', 'log10_k_oil_air',
+        'solvent_surrogate', 'gamma_inf', 'unifac_groups', 'unifac_groups_source',
+        'unifac_parameters', 'vapor_pressure_kpa', 'vapor_pressure_source',
+        'vapor_pressure_measured', 'notes'
+    )}
+    notes = []
+
+    def output():
+        ret['notes'] = '; '.join(notes) if notes else None
+        series = pd.Series(ret)
+        if verbose:
+            print(series.to_string())
+        return series
+
+    if isnull(inchi):
+        return output()
+
+    if log_k_oil_air is not None:
+        log_k = log_k_oil_air
+        ret['k_henry_pfo_method'] = pfo_log_k_method
+        sources = f'{pfo_log_k_method}: {log_k_oil_air:.3g}'
+
+    elif abraham_l is not None:
+        log_k = abraham_l
+        ret['k_henry_pfo_method'] = pfo_abraham_l_method
+        sources = f'{pfo_abraham_l_method}: {abraham_l:.3g}'
+        if abs(temp_c - 25) > 0.5:
+            notes.append('Abraham L is for 25 C (not corrected for temperature)')
+
+    else:
+        ret['k_henry_pfo_method'] = pfo_unifac_method
+        ret['solvent_surrogate'] = solvent
+
+        mol = Chem.MolFromInchi(_inchi_with_prefix(inchi))
+        if mol is None:
+            notes.append('could not parse InChI')
+            return output()
+        inchikey = Chem.MolToInchiKey(mol)
+
+        meta = _thermo_search(inchikey)
+        if meta is None:
+            # (e.g. stereoisomers thermo doesn't have, with the same properties)
+            meta = _thermo_search(inchikey.split('-')[0] + '-UHFFFAOYSA-N')
+            if meta is not None:
+                notes.append(f'thermo properties from {meta.common_name} (same '
+                    'skeleton, without stereochemistry)'
+                )
+
+        chemical = None
+        solid = None
+        if meta is not None:
+            try:
+                chemical = Chemical(meta.CASs, T=temp_k)
+            # (thermo can fail to load properties many ways)
+            except Exception as err:
+                notes.append(f'thermo could not load properties ({err})')
+
+        if chemical is not None and chemical.Tm is not None and (
+            chemical.Tm_source not in _thermo_estimated_tm_methods):
+            solid = temp_k < chemical.Tm
+            if solid:
+                notes.append(f'thermo melting point is {chemical.Tm - 273.15:.0f} C '
+                    f'({chemical.Tm_source}), so solid at {temp_c:g} C: K only applies '
+                    'below its solubility in the oil'
+                )
+
+        if vapor_pressure_kpa is not None:
+            psat = vapor_pressure_kpa * 1000
+            ret['vapor_pressure_source'] = 'passed in'
+        else:
+            psat, ret['vapor_pressure_source'], ret['vapor_pressure_measured'] = (
+                _pfo_vapor_pressure(inchi, chemical, temp_k, solid)
+            )
+
+        if psat is None:
+            notes.append('no vapor pressure')
+            return output()
+        ret['vapor_pressure_kpa'] = psat / 1000
+
+        groups, ret['unifac_groups_source'] = _unifac_groups(inchikey,
+            Chem.MolToSmiles(mol)
+        )
+        if groups is None:
+            notes.append(f'no UNIFAC groups: {ret["unifac_groups_source"]}')
+            return output()
+        ret['unifac_groups'] = ' '.join(f'{unifac.DOUFSG[k].group}:{n}'
+            for k, n in sorted(groups.items())
+        )
+
+        solvent_conc, solvent_groups = _pfo_surrogate(solvent, temp_k)
+
+        parameter_sets = {'Dortmund 2016': unifac.DOUFIP2016,
+            'modified UNIFAC 2.0': unifac.DOUF2IP
+        }
+        main_groups = sorted({unifac.DOUFSG[k].main_group_id
+            for g in (groups, solvent_groups) for k in g
+        })
+        for name, params in parameter_sets.items():
+            if all(b in params.get(a, {}) for a in main_groups for b in main_groups
+                if a != b):
+                ret['unifac_parameters'] = name
+                break
+        else:
+            notes.append('no UNIFAC interaction parameters for some groups')
+            return output()
+
+        model = unifac.UNIFAC.from_subgroups(T=temp_k, xs=[0.5, 0.5],
+            chemgroups=[groups, solvent_groups], version=1,
+            interaction_data=params, subgroups=unifac.DOUFSG
+        )
+        ret['gamma_inf'] = float(model.gammas_infinite_dilution()[0])
+        log_k = np.log10(solvent_conc * gas_constant * temp_k / (ret['gamma_inf'] * psat))
+
+        main_group_names = {unifac.DOUFSG[k].main_group for k in groups}
+        if main_group_names & {'COOH', 'HCOOH'}:
+            notes.append('carboxylic acid: UNIFAC ignores acid dimerization, so K is '
+                'uncertain'
+            )
+        elif main_group_names & {'OH', 'CH3OH', 'ACOH'}:
+            notes.append('OH group: self-association lowers solubility at higher '
+                'concentrations'
+            )
+
+        measured = 'measured' if ret['vapor_pressure_measured'] else (
+            'not measured' if ret['vapor_pressure_source'] != 'passed in' else
+            'passed in'
+        )
+        sources = (f'{pfo_unifac_method}: gamma_inf in {solvent} (modified UNIFAC, '
+            f'{ret["unifac_parameters"]} parameters, groups from '
+            f'{ret["unifac_groups_source"]}), vapor pressure from '
+            f'{ret["vapor_pressure_source"]} ({measured})'
+        )
+
+    ret['k_henry_pfo_measured_partitioning'] = (
+        ret['k_henry_pfo_method'] != pfo_unifac_method
+    )
+    ret['log10_k_oil_air'] = log_k
+    ret['k_henry_pfo'] = 10**log_k / (gas_constant * temp_k)
+    ret['k_henry_pfo_units'] = 'mol / m^3 / Pa'
+    ret['k_henry_pfo_sources'] = sources
+    return output()
+
+
 def add_properties(df, props=None, verbose=False):
     """Adds chemicals properties to DataFrame `df` with `inchi` in columns.
     """
