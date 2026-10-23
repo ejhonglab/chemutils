@@ -1,0 +1,16 @@
+# Example input for oil_headspace.py (tab-separated; lines starting with # are ignored).
+# Only 'id' is required: a PubChem CID or a full InChI.
+# Optional columns, leave blank to use the defaults:
+#   psat_pa       vapor pressure at the run temperature [Pa] (overrides thermo's value)
+#   density_g_ml  density of the neat odorant [g/mL] (used to convert v/v)
+#   abraham_L     Abraham L descriptor, log10 K(hexadecane/air) at 25 C (e.g. from the UFZ-LSER database)
+#   logK          measured log10 K(oil/air) at the run temperature
+#   groups        Dortmund UNIFAC subgroups as "id:count id:count", e.g. "1:1 2:1 14:1" for ethanol
+# Linalool's psat_pa (0.17 mmHg at 25 C, supplier data) replaces thermo's estimate (~170 Pa), which is ~8x too high.
+id	name	psat_pa	density_g_ml	abraham_L	logK	groups
+702	ethanol
+8857	ethyl acetate
+240	benzaldehyde
+7362	furfural
+7991	valeric acid
+InChI=1S/C10H18O/c1-5-10(4,11)8-6-7-9(2)3/h5,7,11H,1,6,8H2,2-4H3	linalool	22.7
