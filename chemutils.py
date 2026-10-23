@@ -39,6 +39,7 @@ import pint
 from tokenize import TokenError
 # TODO add rdkit to requirements if not already there
 # (does it still need special build for inchi support? pypi version have it?)
+from rdkit import Chem
 from rdkit.Chem.inchi import InchiToInchiKey
 import requests
 from requests.adapters import HTTPAdapter
@@ -3230,6 +3231,315 @@ def inchi2vapor_pressure(inchi, skip_unit_parse_err=True, verbose=False):
         'vapor_pressure': ret['quantity'],
         'vapor_pressure_sources': ret['sources'],
         'vapor_pressure_units': ret['units'],
+    })
+
+
+# SIMPOL.1 coefficients (B_k,1, ..., B_k,4), from Table 5 of Pankow & Asher (2008)
+simpol_doi_url = 'https://doi.org/10.5194/acp-8-2773-2008'
+_simpol_coefs = {
+    'zeroeth': (-4.26938e+02, 2.89223e-01, 4.42057e-03, 2.92846e-01),
+    'carbon': (-4.11248e+02, 8.96919e-01, -2.48607e-03, 1.40312e-01),
+    'carbon_acid_side_amide': (-1.46442e+02, 1.54528e+00, 1.71021e-03, -2.78291e-01),
+    'aromatic_ring': (3.50262e+01, -9.20839e-01, 2.24399e-03, -9.36300e-02),
+    'nonaromatic_ring': (-8.72770e+01, 1.78059e+00, -3.07187e-03, -1.04341e-01),
+    'c_c': (5.73335e+00, 1.69764e-02, -6.28957e-04, 7.55434e-03),
+    'c_c_c_o_in_ring': (-2.61268e+02, -7.63282e-01, -1.68213e-03, 2.89038e-01),
+    'hydroxyl': (-7.25373e+02, 8.26326e-01, 2.50957e-03, -2.32304e-01),
+    'aldehyde': (-7.29501e+02, 9.86017e-01, -2.92664e-03, 1.78077e-01),
+    'ketone': (-1.37456e+01, 5.23486e-01, 5.50298e-04, -2.76950e-01),
+    'carboxylic_acid': (-7.98796e+02, -1.09436e+00, 5.24132e-03, -2.28040e-01),
+    'ester': (-3.93345e+02, -9.51778e-01, -2.19071e-03, 3.05843e-01),
+    'ether': (-1.44334e+02, -1.85617e+00, -2.37491e-05, 2.88290e-01),
+    'ether_alicyclic': (4.05265e+01, -2.43780e+00, 3.60133e-03, 9.86422e-02),
+    'ether_aromatic': (-7.07406e+01, -1.06674e+00, 3.73104e-03, -1.44003e-01),
+    'nitrate': (-7.83648e+02, -1.03439e+00, -1.07148e-03, 3.15535e-01),
+    'nitro': (-5.63872e+02, -7.18416e-01, 2.63016e-03, -4.99470e-02),
+    'aromatic_hydroxyl': (-4.53961e+02, -3.26105e-01, -1.39780e-04, -3.93916e-02),
+    'amine_primary': (3.71375e+01, -2.66753e+00, 1.01483e-03, 2.14233e-01),
+    'amine_secondary': (-5.03710e+02, 1.04092e+00, -4.12746e-03, 1.82790e-01),
+    'amine_tertiary': (-3.59763e+01, -4.08458e-01, 1.67264e-03, -9.98919e-02),
+    'amine_aromatic': (-6.09432e+02, 1.50436e+00, -9.09024e-04, -1.35495e-01),
+    'amide_primary': (-1.02367e+02, -7.16253e-01, -2.90670e-04, -5.88556e-01),
+    'amide_secondary': (-1.93802e+03, 6.48262e-01, 1.73245e-03, 3.47940e-02),
+    'amide_tertiary': (-5.26919e+00, 3.06435e-01, 3.25397e-03, -6.81506e-01),
+    'carbonylperoxynitrate': (-2.84042e+02, -6.25424e-01, -8.22474e-04, -8.80549e-02),
+    'peroxide': (1.50093e+02, 2.39875e-02, -3.37969e-03, 1.52789e-02),
+    'hydroperoxide': (-2.03387e+01, -5.48718e+00, 8.39075e-03, 1.07884e-01),
+    'carbonylperoxyacid': (-8.38064e+02, -1.09600e+00, -4.24385e-04, 2.81812e-01),
+    'nitrophenol': (-5.27934e+01, -4.63689e-01, -5.11647e-03, 3.84965e-01),
+    'nitroester': (-1.61520e+03, 9.01669e-01, 1.44536e-03, 2.66889e-01),
+}
+# Temperature range of the data SIMPOL.1 was fit to.
+_simpol_temp_range_c = (0.0, 120.0)
+
+# Carbons not double bonded to O/N/S (i.e. not acyl or imine carbons).
+_simpol_c = '[#6;!$([#6]=[O,N,S])]'
+# N single bonded only to carbons, none of which are acyl/imine carbons.
+_simpol_amine_n = '[NX3;+0;!$(N~[!#6]);!$(N-[#6]=[O,N,S])'
+# (group, SMARTS, index of match atom that identifies each group). Matches with no
+# index are unique atom sets.
+_simpol_smarts = [
+    ('hydroxyl', '[OX2H1]-[C;!$(C=[O,N,S])]', 0),
+    ('aromatic_hydroxyl', '[OX2H1]-c', 0),
+    ('aldehyde', '[CX3;H1,H2;!$(C-[!#6])]=[OX1]', 0),
+    ('ketone', '[#6]-[CX3](=[OX1])-[#6]', 1),
+    ('carboxylic_acid', '[CX3](=[OX1])-[OX2H1]', 0),
+    ('ester', '[CX3](=[OX1])-[OX2]-[#6]', 0),
+    # (split into the 3 SIMPOL.1 ether groups in _simpol_groups)
+    ('ether', f'{_simpol_c}-,:[#8X2]-,:{_simpol_c}', 1),
+    ('nitrate', '[#6]-[OX2]-[NX3](~[OX1])~[OX1]', 2),
+    ('nitro', '[#6]-[NX3](~[OX1])~[OX1]', 1),
+    ('amine_primary', f'{_simpol_amine_n};H2;!$(N-a)]', 0),
+    ('amine_secondary', f'{_simpol_amine_n};H1;!$(N-a)]', 0),
+    ('amine_tertiary', f'{_simpol_amine_n};H0;!$(N-a)]', 0),
+    ('amine_aromatic', f'{_simpol_amine_n};$(N-a)]', 0),
+    ('amide_primary', '[NX3;+0;H2]-[CX3]=[OX1]', 0),
+    ('amide_secondary', '[NX3;+0;H1](-[#6])-[CX3]=[OX1]', 0),
+    ('amide_tertiary', '[NX3;+0;H0](-[#6])(-[#6])-[CX3]=[OX1]', 0),
+    ('carbonylperoxynitrate', '[CX3](=[OX1])-[OX2]-[OX2]-[NX3](~[OX1])~[OX1]', 0),
+    ('peroxide', f'{_simpol_c}-[OX2]-[OX2]-{_simpol_c}', 1),
+    ('hydroperoxide', f'{_simpol_c}-[OX2]-[OX2H1]', 1),
+    ('carbonylperoxyacid', '[CX3](=[OX1])-[OX2]-[OX2H1]', 0),
+    ('c_c', 'C=C', None),
+    ('c_c_c_o_in_ring', 'C=;@C-;@[C;R]=[OX1]', None),
+]
+_simpol_patterns = None
+
+def _simpol_groups(mol: Chem.Mol) -> Optional[dict]:
+    """Returns counts of each SIMPOL.1 group in `mol`, or None if it is not supported.
+
+    Only single (neutral, non-radical) molecules made of C, H, O and N are supported,
+    and every O and N must be in one of the SIMPOL.1 functional groups (so e.g.
+    nitriles, imines, and aromatic nitrogens are not supported).
+    """
+    global _simpol_patterns
+    if _simpol_patterns is None:
+        _simpol_patterns = [(name, Chem.MolFromSmarts(smarts), i)
+            for name, smarts, i in _simpol_smarts
+        ]
+
+    if len(Chem.GetMolFrags(mol)) > 1:
+        return None
+
+    for atom in mol.GetAtoms():
+        if atom.GetSymbol() not in ('C', 'O', 'N') or atom.GetNumRadicalElectrons() > 0:
+            return None
+
+    counts = {k: 0 for k in _simpol_coefs}
+    counts['zeroeth'] = 1
+    counts['carbon'] = sum(a.GetSymbol() == 'C' for a in mol.GetAtoms())
+
+    aromatic_rings = []
+    for ring in Chem.GetSSSR(mol):
+        if all(mol.GetAtomWithIdx(i).GetIsAromatic() for i in ring):
+            aromatic_rings.append(set(ring))
+        else:
+            counts['nonaromatic_ring'] += 1
+    counts['aromatic_ring'] = len(aromatic_rings)
+
+    # group -> list of matches (one per group)
+    matches = dict()
+    covered = set()
+    for name, pattern, key_index in _simpol_patterns:
+        group_matches = mol.GetSubstructMatches(pattern)
+        if key_index is not None:
+            by_key = dict()
+            for match in group_matches:
+                by_key.setdefault(match[key_index], match)
+            group_matches = list(by_key.values())
+
+        matches[name] = group_matches
+        for match in group_matches:
+            covered.update(match)
+
+    # Checking all N/O (and charged atoms, which are only allowed in nitro / nitrate
+    # groups) are in some group.
+    for atom in mol.GetAtoms():
+        if (atom.GetSymbol() != 'C' or atom.GetFormalCharge() != 0) and (
+            atom.GetIdx() not in covered):
+            return None
+
+    for name, group_matches in matches.items():
+        if name != 'ether':
+            counts[name] = len(group_matches)
+
+    for _, o_idx, _ in matches['ether']:
+        oxygen = mol.GetAtomWithIdx(o_idx)
+        if any(n.GetIsAromatic() for n in oxygen.GetNeighbors()):
+            counts['ether_aromatic'] += 1
+        elif oxygen.IsInRing():
+            counts['ether_alicyclic'] += 1
+        else:
+            counts['ether'] += 1
+
+    nitro_n = {match[1] for match in matches['nitro']}
+
+    def has_nitro(atom_idx):
+        return any(n.GetIdx() in nitro_n
+            for n in mol.GetAtomWithIdx(atom_idx).GetNeighbors()
+        )
+
+    def connected_atoms(start_idx, exclude_idx):
+        """Returns indices of atoms connected to `start_idx`, not via `exclude_idx`.
+        """
+        seen = {start_idx, exclude_idx}
+        to_visit = [start_idx]
+        while to_visit:
+            for n in mol.GetAtomWithIdx(to_visit.pop()).GetNeighbors():
+                if n.GetIdx() not in seen:
+                    seen.add(n.GetIdx())
+                    to_visit.append(n.GetIdx())
+
+        seen.remove(exclude_idx)
+        return seen
+
+    # Nitrophenol group replaces aromatic hydroxyl if a nitro is on the same ring.
+    for _, c_idx in matches['aromatic_hydroxyl']:
+        if any(c_idx in r and any(has_nitro(i) for i in r) for r in aromatic_rings):
+            counts['aromatic_hydroxyl'] -= 1
+            counts['nitrophenol'] += 1
+
+    # Nitroester group replaces ester if a nitro is on the acid side of the ester.
+    for c_idx, _, o_idx, _ in matches['ester']:
+        if any(has_nitro(i) for i in connected_atoms(c_idx, o_idx)):
+            counts['ester'] -= 1
+            counts['nitroester'] += 1
+
+    # Carbons on the acid side of each amide, including the carbonyl carbon (e.g. 4 for
+    # N-propyl-butyramide).
+    for name in ('amide_primary', 'amide_secondary', 'amide_tertiary'):
+        for match in matches[name]:
+            n_idx, c_idx = match[0], match[-2]
+            counts['carbon_acid_side_amide'] += sum(
+                mol.GetAtomWithIdx(i).GetSymbol() == 'C'
+                for i in connected_atoms(c_idx, n_idx)
+            )
+
+    return counts
+
+
+# Compounds SIMPOL.1 groups can be assigned to, but for which estimates were far from
+# PubChem values (see scripts/validate_est_vapor_pressure.py).
+_simpol_excluded_smarts = {
+    # (~30-300x too high)
+    'lactone / cyclic anhydride': '[#6;R](=O)@[#8;R]',
+}
+_simpol_excluded_patterns = None
+
+def _simpol_exclusion_reason(mol: Chem.Mol, counts: dict) -> Optional[str]:
+    """Returns which excluded class `mol` is in, or None if not excluded.
+    """
+    global _simpol_excluded_patterns
+    if _simpol_excluded_patterns is None:
+        _simpol_excluded_patterns = {name: Chem.MolFromSmarts(smarts)
+            for name, smarts in _simpol_excluded_smarts.items()
+        }
+
+    for name, pattern in _simpol_excluded_patterns.items():
+        if mol.HasSubstructMatch(pattern):
+            return name
+
+    # (would be zwitterions, which are far less volatile than estimated)
+    if counts['carboxylic_acid'] > 0 and any(counts[f'amine_{x}'] > 0
+        for x in ('primary', 'secondary', 'tertiary')):
+        return 'amino acid'
+
+    return None
+
+
+def _simpol_log10_p_atm(counts: dict, temp_k: float) -> float:
+    """Returns SIMPOL.1 log10 of (subcooled) liquid vapor pressure [atm].
+    """
+    log10_p = 0.0
+    for name, n in counts.items():
+        b1, b2, b3, b4 = _simpol_coefs[name]
+        log10_p += n * (b1 / temp_k + b2 + b3 * temp_k + b4 * np.log(temp_k))
+
+    return log10_p
+
+
+def inchi2est_vapor_pressure(inchi, temp_c: float = 25.0, verbose: bool = False
+    ) -> pd.Series:
+    """Returns vapor pressure estimated from structure, for when no measurements found.
+
+    Intended for compounds where `inchi2vapor_pressure` returns null values. Uses the
+    SIMPOL.1 group contribution method (Pankow & Asher, 2008), which only depends on the
+    structure, so this requires no network access (and is not cached).
+
+    Estimates are of the liquid vapor pressure, which for compounds that are solid at
+    `temp_c` is that of the subcooled liquid (higher than that of the solid).
+
+    Compared to PubChem values stated at 25 C (scripts/validate_est_vapor_pressure.py),
+    the median error was ~2x (65% of 371 compounds within 3x, and 89% within 10x).
+    Errors were lower for simple aliphatic esters, aldehydes, ketones, alcohols, and
+    hydrocarbons (often within 1.5x), but these were typically underestimated:
+    - furans: ~10x
+    - tertiary alcohols (e.g. linalool): ~6x
+    - phenols with an O-containing group ortho to the OH (e.g. guaiacol, eugenol,
+      methyl salicylate), where intramolecular hydrogen bonds increase volatility:
+      ~10-50x
+    - ethers: ~3x
+
+    Estimates are less accurate away from ~25 C (e.g. n-hexane at its boiling point is
+    overestimated ~1.7x).
+
+    Args:
+        temp_c: temperature [C] to estimate vapor pressure at. SIMPOL.1 was fit to
+            data from 0-120 C.
+
+        verbose: if True, prints SIMPOL.1 group counts.
+
+    Returns:
+        Series with same keys as `inchi2vapor_pressure` output. Values are null if the
+        compound is not supported, which includes compounds with atoms other than C, H,
+        O and N, compounds with N/O not in one of the SIMPOL.1 groups (e.g. nitriles,
+        imines, aromatic nitrogens), lactones (estimates ~30-300x too high), and amino
+        acids.
+    """
+    ret_keys = [
+        'vapor_pressure',
+        'vapor_pressure_sources',
+        'vapor_pressure_units',
+    ]
+    null_ret = pd.Series({k: None for k in ret_keys})
+
+    if isnull(inchi):
+        return null_ret
+
+    lo, hi = _simpol_temp_range_c
+    if not lo <= temp_c <= hi:
+        warn(f'{temp_c=} outside temperature range SIMPOL.1 was fit to ({lo}-{hi} C)')
+
+    mol = Chem.MolFromInchi(_inchi_with_prefix(inchi))
+    if mol is None:
+        warn(f'could not parse InChI {inchi}')
+        return null_ret
+
+    counts = _simpol_groups(mol)
+    if counts is None:
+        warn(f'can not estimate vapor pressure of {inchi} ({Chem.MolToSmiles(mol)}): '
+            'has atoms / functional groups not supported by SIMPOL.1'
+        )
+        return null_ret
+
+    exclusion_reason = _simpol_exclusion_reason(mol, counts)
+    if exclusion_reason is not None:
+        warn(f'not estimating vapor pressure of {inchi} ({Chem.MolToSmiles(mol)}): '
+            f'SIMPOL.1 estimates for class ({exclusion_reason}) are far from measured '
+            'values'
+        )
+        return null_ret
+
+    if verbose:
+        print(f'SIMPOL.1 groups for {inchi}:')
+        print(pformat({k: v for k, v in counts.items() if v != 0}))
+
+    log10_p_atm = _simpol_log10_p_atm(counts, temp_c + 273.15)
+    units = property2preferred_units['vapor_pressure']
+    return pd.Series({
+        'vapor_pressure': ureg.Quantity(10**log10_p_atm, 'atm').to(units).magnitude,
+        'vapor_pressure_sources': f'SIMPOL.1 estimate ({simpol_doi_url})',
+        'vapor_pressure_units': units,
     })
 
 

@@ -23,6 +23,15 @@ import chemutils as cu
 cas_number_str = cu.name2cas('ethyl acetate')
 ```
 
+### Vapor pressure estimates
+For compounds where `cu.inchi2vapor_pressure` finds no PubChem value,
+`cu.inchi2est_vapor_pressure` estimates it from structure alone (SIMPOL.1 group
+contribution method, offline). See its docstring for accuracy and which compounds it
+supports. To compare its estimates to PubChem values:
+```
+python scripts/validate_est_vapor_pressure.py --pubchem-25c pubchem_vp_strings.json
+```
+
 ### Cache
 Lookup results are cached in an SQLite database at `~/.chemutils_cache.sqlite` (set the
 `CHEMUTILS_CACHE` environment variable to use another path). Input IDs are normalized
